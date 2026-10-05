@@ -1,0 +1,21 @@
+{
+  "name": "dingo-pack",
+  "displayName": "dingo-pack",
+  "version": "0.1.1",
+  "description": "The pack eats in order: heavy-job slots, memory admission and a crash-recovery session roster for many Claude Code sessions on one machine. Ships the dingo-pack CLI, roster hooks, an optional heavy-work hint hook and a skill.",
+  "author": {
+    "name": "liyifreddy"
+  },
+  "homepage": "https://github.com/liyifreddy/dingo-pack",
+  "repository": "https://github.com/liyifreddy/dingo-pack",
+  "license": "MIT",
+  "keywords": [
+    "multi-agent",
+    "memory",
+    "oom",
+    "queue",
+    "sessions",
+    "wsl",
+    "hooks"
+  ]
+}

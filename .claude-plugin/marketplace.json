@@ -1,0 +1,12 @@
+{
+  "name": "dingo-pack",
+  "description": "dingo-pack: heavy-job slots and a crash-recovery roster for many Claude Code sessions on one machine.",
+  "owner": { "name": "liyifreddy" },
+  "plugins": [
+    {
+      "name": "dingo-pack",
+      "source": "./",
+      "description": "Heavy-job slots + memory admission + session roster (save / list / resume) for concurrent Claude Code sessions."
+    }
+  ]
+}

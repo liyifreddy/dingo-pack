@@ -1,0 +1,1457 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""dingo-pack - heavy-job slots, memory admission and a session roster for many agents on one machine.
+
+A pack of dingoes eats in order. dingo-pack makes a dozen coding agents on one
+machine take turns at heavy work (test suites, model loads, big builds) instead of
+starting them all at once and running the machine out of memory, and keeps a
+roster of the agent sessions so that after a crash you can bring the whole pack back.
+
+Slots and memory:
+  dingo-pack run --heavy [--mem 6G] [--limit 9G] [--tree-limit 9G] -- CMD...
+                                   wait for a slot + enough free memory, run CMD under limits
+  dingo-pack lease [--mem 4G] [--for 45m] [--note TEXT]
+                                   hold a slot for work you cannot wrap (an in-agent review, ...)
+  dingo-pack release [LEASE_ID...] release your leases (default: all of this session's)
+  dingo-pack who                   who holds slots, who is queuing, memory now
+  dingo-pack log [-n N]            recent job lines
+
+Roster (Claude Code sessions):
+  dingo-pack save [--hook] [--every SECONDS]   snapshot live sessions to a local roster
+  dingo-pack mark STATE [--until WHEN] [NOTE]  self-report: running (= midway) | waiting | blocked | done
+  dingo-pack list [--since HOURS] [--json]     sessions from the roster, grouped for resuming
+  dingo-pack resume NAME... | --midway | --lost [--via wt|tmux|print] [--yes] [--dry-run]
+
+Standard library only. Python >= 3.8, Linux/macOS/WSL (needs fcntl).
+"""
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+__version__ = "0.1.1"
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_TIMEOUT = 75          # EX_TEMPFAIL: no slot / not enough memory within --timeout
+EXIT_TREE_LIMIT = 137      # the job's process tree went over --tree-limit and was stopped
+
+GIB = 1024 ** 3
+MIB = 1024 ** 2
+
+NONLOCAL_FS = {"9p", "drvfs", "nfs", "nfs4", "cifs", "smb3", "smbfs", "fuse",
+               "fuseblk", "fuse.sshfs", "v9fs", "virtiofs"}
+
+STATES = ("midway", "running", "waiting", "blocked", "done")   # running = midway
+
+
+# ---------------------------------------------------------------- helpers
+
+def eprint(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def now():
+    return time.time()
+
+
+def hhmm(t):
+    return time.strftime("%m-%d %H:%M", time.localtime(t)) if t else "-"
+
+
+def state_dir():
+    d = os.environ.get("DINGO_HOME")
+    if not d:
+        base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+        d = os.path.join(base, "dingo-pack")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def sub_dir(name):
+    d = os.path.join(state_dir(), name)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def claude_home():
+    return os.environ.get("DINGO_CLAUDE_HOME") or os.path.expanduser("~/.claude")
+
+
+def fs_type(path):
+    """Best-effort filesystem type of `path` from /proc/mounts (Linux only)."""
+    try:
+        path = os.path.realpath(path)
+        best, best_t = "", None
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt = parts[1].replace("\\040", " ")
+                if (path == mnt or path.startswith(mnt.rstrip("/") + "/")) and len(mnt) > len(best):
+                    best, best_t = mnt, parts[2]
+        return best_t
+    except OSError:
+        return None
+
+
+def check_local_state():
+    t = fs_type(state_dir())
+    if t in NONLOCAL_FS:
+        eprint(f"dingo-pack: state dir {state_dir()} is on a {t} mount; flock there is not "
+               "reliable. Set DINGO_HOME to a local disk.")
+        sys.exit(EXIT_USAGE)
+
+
+def write_atomic(path, text):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?)i?b?\s*$", re.I)
+
+
+def parse_size(s):
+    """'6G' / '512M' / '1.5g' / '0' -> bytes (int). Bare numbers are GiB."""
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        return int(s * GIB)
+    m = SIZE_RE.match(str(s))
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad size: {s!r} (use e.g. 6G, 512M)")
+    n, unit = float(m.group(1)), m.group(2).lower()
+    mult = {"": GIB, "k": 1024, "m": MIB, "g": GIB, "t": 1024 * GIB}[unit]
+    return int(n * mult)
+
+
+def parse_duration(s):
+    """'45m' / '2h' / '90s' / '30' (minutes) -> seconds."""
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", str(s), re.I)
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad duration: {s!r} (use e.g. 45m, 2h)")
+    return float(m.group(1)) * {"": 60, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2).lower()]
+
+
+def fmt_duration(sec):
+    return f"{sec:.0f} s" if sec < 120 else f"{sec / 60:.0f} min"
+
+
+def fmt_size(b):
+    if b is None:
+        return "-"
+    return f"{b / GIB:.1f}G" if b >= GIB else f"{b / MIB:.0f}M"
+
+
+def config():
+    """User config ~/.config/dingo-pack/config.json, overridden by env vars."""
+    path = os.environ.get("DINGO_CONFIG") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "dingo-pack", "config.json")
+    cfg = read_json(path, {}) or {}
+    env = {"slots": "DINGO_SLOTS", "default_mem": "DINGO_DEFAULT_MEM", "reserve": "DINGO_RESERVE"}
+    for k, e in env.items():
+        if os.environ.get(e):
+            cfg[k] = os.environ[e]
+    return cfg
+
+
+def local_project_config(cwd):
+    """Per-project settings from the user config only (local disk; never blocks)."""
+    return (config().get("projects") or {}).get(os.path.normpath(cwd)) or {}
+
+
+def project_config(cwd):
+    """Per-project roster settings: <cwd>/.dingo-pack.json, else config()['projects'][cwd].
+    May touch the project directory, which can be a slow or hung network mount."""
+    c = read_json(os.path.join(cwd, ".dingo-pack.json"))
+    if c is None:
+        c = local_project_config(cwd)
+    return c
+
+
+def session_label(args=None):
+    s = getattr(args, "session", None) if args else None
+    s = s or os.environ.get("DINGO_SESSION")
+    if s:
+        return s
+    pid = os.environ.get("CLAUDE_PID")
+    if pid and pid.isdigit():
+        e = read_json(os.path.join(claude_home(), "sessions", f"{pid}.json"), {}) or {}
+        if e.get("nameSource") == "user" and e.get("name"):
+            return e["name"]
+    return os.environ.get("CLAUDE_CODE_SESSION_ID", "")[:8] or f"{socket.gethostname()}:{os.getppid()}"
+
+
+# ---------------------------------------------------------------- processes and memory
+
+def meminfo():
+    """(MemTotal, MemAvailable) in bytes. DINGO_FAKE_MEMINFO points at a test file."""
+    path = os.environ.get("DINGO_FAKE_MEMINFO", "/proc/meminfo")
+    vals = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                k, _, rest = line.partition(":")
+                parts = rest.split()
+                if parts:
+                    vals[k.strip()] = int(parts[0]) * 1024
+        return vals.get("MemTotal"), vals.get("MemAvailable", vals.get("MemFree"))
+    except OSError:
+        pass
+    if sys.platform == "darwin":
+        try:
+            total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                                       text=True).stdout.strip())
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+            page = int(re.search(r"page size of (\d+)", out).group(1))
+            pages = 0
+            for key in ("Pages free", "Pages inactive", "Pages speculative"):
+                m = re.search(key + r":\s+(\d+)", out)
+                if m:
+                    pages += int(m.group(1))
+            return total, pages * page
+        except (OSError, ValueError, AttributeError):
+            pass
+    return None, None
+
+
+def proc_table():
+    """{pid: (ppid, rss_bytes)} for all processes."""
+    table = {}
+    if os.path.isdir("/proc/self"):
+        page = os.sysconf("SC_PAGE_SIZE")
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                with open(f"/proc/{d}/stat") as f:
+                    st = f.read()
+                ppid = int(st[st.rindex(")") + 2:].split()[1])
+                with open(f"/proc/{d}/statm") as f:
+                    rss = int(f.read().split()[1]) * page
+                table[int(d)] = (ppid, rss)
+            except (OSError, ValueError, IndexError):
+                continue
+        return table
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,rss="], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) == 3:
+            table[int(p[0])] = (int(p[1]), int(p[2]) * 1024)
+    return table
+
+
+def tree_pids(root, table=None):
+    table = table if table is not None else proc_table()
+    kids = {}
+    for pid, (ppid, _) in table.items():
+        kids.setdefault(ppid, []).append(pid)
+    out, stack = [], [root]
+    while stack:
+        p = stack.pop()
+        if p in table:
+            out.append(p)
+        stack.extend(kids.get(p, []))
+    return out
+
+
+def proc_pss(pid):
+    """Proportional set size in bytes (shared pages split between their users), or None."""
+    try:
+        with open(f"/proc/{pid}/smaps_rollup") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def tree_rss(root, table=None):
+    """Memory of the process tree under `root`. Uses PSS where the kernel provides it, so pages
+    a forked worker shares with its parent are counted once; falls back to RSS (which counts
+    them once per process and so overestimates fork-heavy jobs)."""
+    table = table if table is not None else proc_table()
+    total = 0
+    for p in tree_pids(root, table):
+        v = proc_pss(p)
+        total += v if v is not None else table.get(p, (0, 0))[1]
+    return total
+
+
+def proc_start(pid):
+    """Process start time in clock ticks since boot (Linux), or None."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            st = f.read()
+        return int(st[st.rindex(")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def pid_alive(pid, start=None):
+    """True if pid exists (and, when `start` is known and /proc is there, started then)."""
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except (OSError, ValueError):
+        return False
+    if start not in (None, ""):
+        cur = proc_start(int(pid))
+        if cur is not None and str(cur) != str(start):
+            return False           # pid was reused by another process
+    return True
+
+
+def boot_time():
+    if os.environ.get("DINGO_FAKE_BTIME"):
+        return float(os.environ["DINGO_FAKE_BTIME"])
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime"):
+                    return float(line.split()[1])
+    except OSError:
+        pass
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
+            return float(re.search(r"sec = (\d+)", out).group(1))
+        except (OSError, AttributeError, ValueError):
+            pass
+    return None
+
+
+def owner_process():
+    """(pid, start) of the agent process this command runs under: Claude Code sets CLAUDE_PID."""
+    pid = os.environ.get("DINGO_OWNER_PID") or os.environ.get("CLAUDE_PID")
+    if pid and pid.isdigit() and pid_alive(int(pid)):
+        return int(pid), proc_start(int(pid))
+    return None, None
+
+
+# ---------------------------------------------------------------- slots
+
+class Deadline(Exception):
+    pass
+
+
+def _alarm(signum, frame):
+    raise Deadline()
+
+
+class Slots:
+    """N flock'ed slot files plus one queue lock; the head of the queue is always served next."""
+
+    def __init__(self, n):
+        self.n = max(1, int(n))
+        self.dir = sub_dir("slots")
+        self.qfd = None
+        self.fd = None
+        self.index = None
+
+    def slot_path(self, i):
+        return os.path.join(self.dir, f"slot-{i}")
+
+    def holder_path(self, i):
+        return self.slot_path(i) + ".holder"
+
+    def _lock_queue(self, deadline):
+        self.qfd = os.open(os.path.join(self.dir, "queue"), os.O_RDWR | os.O_CREAT, 0o644)
+        if deadline is None:
+            fcntl.flock(self.qfd, fcntl.LOCK_EX)
+            return
+        left = deadline - now()
+        if left <= 0:
+            raise Deadline()
+        old = signal.signal(signal.SIGALRM, _alarm)
+        signal.setitimer(signal.ITIMER_REAL, left)
+        try:
+            fcntl.flock(self.qfd, fcntl.LOCK_EX)
+        except Deadline:
+            try:                        # the alarm may have raced a successful flock
+                fcntl.flock(self.qfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise Deadline()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+
+    def _try_slot(self):
+        for i in range(self.n):
+            fd = os.open(self.slot_path(i), os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                os.close(fd)
+                if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    continue
+                raise
+            self.fd, self.index = fd, i
+            return True
+        return False
+
+    def acquire(self, est, reserve, timeout, waiting_rec, quiet=False):
+        """Block until we hold a slot and memory admits `est` bytes. Returns (slot_wait_s, mem_wait_s).
+
+        The holder record (with `est`) is written *before* the queue lock is dropped, so the
+        next one in line already counts our promised memory when it checks admission."""
+        deadline = now() + timeout if timeout else None
+        wpath = os.path.join(sub_dir("waiting"), f"{os.getpid()}.json")
+        write_atomic(wpath, json.dumps(dict(waiting_rec, pid=os.getpid(), since=now(), phase="queue")))
+        t0 = now()
+        noted = 0.0
+        try:
+            self._lock_queue(deadline)
+            while not self._try_slot():
+                if deadline and now() > deadline:
+                    raise Deadline()
+                if not quiet and now() - noted > 60:
+                    eprint(f"dingo-pack: all {self.n} slots busy; waiting ({int(now() - t0)} s)")
+                    noted = now()
+                time.sleep(0.2)
+            t1 = now()
+            write_atomic(wpath, json.dumps(dict(waiting_rec, pid=os.getpid(), since=t0, phase="memory")))
+            noted = 0.0
+            while True:
+                ok, why = admit(est, reserve, exclude=self.index, n=self.n)
+                if ok:
+                    break
+                if deadline and now() > deadline:
+                    raise Deadline()
+                if not quiet and now() - noted > 60:
+                    eprint(f"dingo-pack: waiting for memory: {why}")
+                    noted = now()
+                time.sleep(float(os.environ.get("DINGO_MEM_POLL_S", "2")))
+            self.write_holder(dict(waiting_rec, pid=os.getpid(), since=now(), op="starting"))
+            return t1 - t0, now() - t1
+        except BaseException:
+            self.release()
+            raise
+        finally:
+            try:
+                os.unlink(wpath)
+            except OSError:
+                pass
+            if self.qfd is not None:
+                os.close(self.qfd)      # closing drops the queue flock; the next in line goes
+                self.qfd = None
+
+    def write_holder(self, rec):
+        write_atomic(self.holder_path(self.index), json.dumps(rec))
+
+    def release(self):
+        """Give the slot back. flock(LOCK_UN) releases the lock for every holder of this open
+        file description, so a background grandchild that inherited it cannot keep the slot."""
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(self.fd)
+            self.fd, self.index = None, None
+
+    def close_only(self):
+        """Drop our descriptor but keep the lock (another process holds the same description)."""
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd, self.index = None, None
+
+
+def slot_held(path):
+    """True if someone holds the flock on `path` (tested without taking it for long)."""
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def holders(n=None):
+    """[(index, holder_record)] for slots that are actually held (any index on disk)."""
+    d = sub_dir("slots")
+    out = []
+    for p in sorted(glob.glob(os.path.join(d, "slot-*"))):
+        if p.endswith(".holder") or ".tmp." in p:
+            continue
+        try:
+            i = int(p.rsplit("-", 1)[1])
+        except ValueError:
+            continue
+        if slot_held(p):
+            out.append((i, read_json(p + ".holder", {}) or {}))
+    return out
+
+
+def admit(est, reserve, exclude=None, n=None):
+    """Memory admission: available - (what running jobs have not yet used) >= est + reserve."""
+    total, avail = meminfo()
+    if avail is None:
+        return True, "memory unknown on this platform; admitting"
+    table = proc_table()
+    unmet = 0
+    for i, h in holders():
+        if i == exclude:
+            continue
+        jp = h.get("job_pid")              # starting / lease: nothing of ours is using it yet
+        e = h.get("est") or 0
+        used = tree_rss(jp, table) if jp else 0
+        unmet += max(0, e - used)
+    need = est + reserve
+    ok = avail - unmet >= need
+    return ok, (f"available {fmt_size(avail)} - promised to running jobs {fmt_size(unmet)} "
+                f"< need {fmt_size(est)} + reserve {fmt_size(reserve)}")
+
+
+def reserve_bytes(cfg):
+    if cfg.get("reserve"):
+        return parse_size(cfg["reserve"])
+    total, _ = meminfo()
+    return max(GIB, int((total or 0) * 0.10))
+
+
+# ---------------------------------------------------------------- log
+
+def log_path():
+    return os.path.join(state_dir(), "log.jsonl")
+
+
+SECRETISH = re.compile(r"(?i)(token|secret|passw|apikey|api_key|bearer)")
+
+
+def cmd_summary(argv):
+    parts = []
+    for a in argv:
+        parts.append("***" if SECRETISH.search(a) and ("=" in a or len(a) > 24) else a)
+    s = shlex.join(parts) if hasattr(shlex, "join") else " ".join(parts)
+    return s[:120]
+
+
+def write_log(rec):
+    try:
+        with open(log_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        eprint(f"dingo-pack: could not write log: {e}")
+
+
+# ---------------------------------------------------------------- run / lease
+
+def resolve_sizes(args, cfg):
+    est = args.mem if args.mem is not None else parse_size(cfg.get("default_mem", "2G"))
+    limit = args.limit if args.limit is not None else int(est * 1.5)
+    tree = args.tree_limit if getattr(args, "tree_limit", None) is not None else limit
+    return est, limit, tree
+
+
+def check_fits(est, reserve):
+    total, _ = meminfo()
+    if total and est + reserve > total:
+        eprint(f"dingo-pack: --mem {fmt_size(est)} + reserve {fmt_size(reserve)} is more than this "
+               f"machine has ({fmt_size(total)}); it would wait forever.")
+        sys.exit(EXIT_USAGE)
+
+
+def kill_tree(root, sig):
+    for p in reversed(tree_pids(root)):
+        try:
+            os.kill(p, sig)
+        except OSError:
+            pass
+
+
+def cmd_run(args):
+    if not args.heavy:
+        eprint("dingo-pack: say --heavy (only heavy jobs are queued; light ones need no dingo-pack)")
+        return EXIT_USAGE
+    cmd = args.cmd
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        eprint("dingo-pack run: no command after --")
+        return EXIT_USAGE
+    check_local_state()
+    cfg = config()
+    est, limit, tree = resolve_sizes(args, cfg)
+    reserve = reserve_bytes(cfg)
+    check_fits(est, reserve)
+    slots = Slots(args.slots or cfg.get("slots", 6))
+    who = session_label(args)
+    rec = {"t": now(), "op": "run", "session": who, "cmd": cmd_summary(cmd), "est": est,
+           "limit": limit, "tree_limit": tree, "host": socket.gethostname()}
+    try:
+        slot_wait, mem_wait = slots.acquire(est, reserve, args.timeout,
+                                            {"session": who, "cmd": rec["cmd"], "est": est})
+    except Deadline:
+        rec.update(rc=EXIT_TIMEOUT, error="timeout waiting for a slot / memory")
+        write_log(rec)
+        eprint(f"dingo-pack: gave up after {args.timeout:.0f} s (no slot or not enough memory)")
+        return EXIT_TIMEOUT
+    except KeyboardInterrupt:
+        return 130
+    rec.update(slot=slots.index, slot_wait_s=round(slot_wait, 2), mem_wait_s=round(mem_wait, 2))
+
+    def preexec():
+        if limit:
+            import resource
+            kind = resource.RLIMIT_AS if args.limit_kind == "as" else resource.RLIMIT_DATA
+            try:
+                resource.setrlimit(kind, (limit, limit))
+            except (ValueError, OSError):
+                pass
+
+    t_start = now()
+    try:
+        # The job inherits the slot lock: if dingo-pack itself is killed, the slot stays
+        # taken until the job is gone too.
+        child = subprocess.Popen(cmd, preexec_fn=preexec, close_fds=True, pass_fds=(slots.fd,))
+    except OSError as e:
+        slots.release()
+        rec.update(rc=127, error=str(e))
+        write_log(rec)
+        eprint(f"dingo-pack: cannot start {cmd[0]}: {e}")
+        return 127
+    slots.write_holder({"session": who, "op": "run", "cmd": rec["cmd"], "est": est, "pid": os.getpid(),
+                        "job_pid": child.pid, "since": t_start, "limit": limit, "tree_limit": tree})
+
+    def forward(signum, frame):
+        kill_tree(child.pid, signum)
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, forward)
+    signal.signal(signal.SIGINT, lambda s, f: None)    # the child gets ^C from the terminal itself
+
+    peak, stopped, t_term = 0, False, None
+    grace = float(os.environ.get("DINGO_KILL_GRACE", "10"))
+    interval = float(os.environ.get("DINGO_SAMPLE_S", "0.5"))
+    while True:
+        try:
+            rc = child.wait(timeout=interval)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        r = tree_rss(child.pid)
+        peak = max(peak, r)
+        if tree and r > tree and not stopped:
+            stopped, t_term = True, now()
+            eprint(f"dingo-pack: process tree uses {fmt_size(r)} > --tree-limit {fmt_size(tree)}; stopping it")
+            kill_tree(child.pid, signal.SIGTERM)
+        elif stopped and now() - t_term > grace:
+            kill_tree(child.pid, signal.SIGKILL)
+    import resource
+    ru = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    ru_bytes = ru if sys.platform == "darwin" else ru * 1024
+    slots.release()
+    if rc < 0:
+        rc = 128 - rc
+    if stopped:
+        rc = EXIT_TREE_LIMIT
+    rec.update(rc=rc, wall_s=round(now() - t_start, 2), peak_tree_rss=peak, peak_proc_rss=ru_bytes,
+               stopped_by_tree_limit=stopped)
+    write_log(rec)
+    if stopped:
+        eprint(f"dingo-pack: stopped by --tree-limit: peak {fmt_size(peak)} / limit {fmt_size(tree)} (exit 137)")
+    return rc
+
+
+def lease_daemon(slots, rec, until, owner_pid, owner_start):
+    """Runs in the forked child: hold the slot until release / expiry / the owner dies."""
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    for s in (signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, signal.SIG_IGN)
+    stop = {"why": None}
+
+    def on_term(signum, frame):
+        stop["why"] = "released"
+    signal.signal(signal.SIGTERM, on_term)
+    rec = dict(rec, pid=os.getpid())
+    slots.write_holder(rec)
+    while stop["why"] is None:
+        if now() >= until:
+            stop["why"] = "expired"
+        elif owner_pid and not pid_alive(owner_pid, owner_start):
+            stop["why"] = "owner exited"
+        else:
+            time.sleep(float(os.environ.get("DINGO_LEASE_POLL_S", "2")))
+    slots.release()
+    write_log(dict(rec, op="lease-end", t=now(), why=stop["why"], held_s=round(now() - rec["since"], 1)))
+    os._exit(0)
+
+
+def cmd_lease(args):
+    check_local_state()
+    cfg = config()
+    est = args.mem if args.mem is not None else parse_size(cfg.get("default_mem", "2G"))
+    reserve = reserve_bytes(cfg)
+    check_fits(est, reserve)
+    slots = Slots(args.slots or cfg.get("slots", 6))
+    who = session_label(args)
+    owner_pid, owner_start = owner_process()
+    if not owner_pid:
+        eprint("dingo-pack: no agent process found (CLAUDE_PID / DINGO_OWNER_PID); the lease ends "
+               "only by `release` or --for")
+    try:
+        slot_wait, mem_wait = slots.acquire(est, reserve, args.timeout,
+                                            {"session": who, "cmd": "lease: " + (args.note or ""), "est": est})
+    except Deadline:
+        write_log({"t": now(), "op": "lease", "session": who, "rc": EXIT_TIMEOUT})
+        eprint("dingo-pack: no slot / memory within --timeout")
+        return EXIT_TIMEOUT
+    t = now()
+    rec = {"session": who, "op": "lease", "cmd": "lease: " + (args.note or ""), "est": est, "since": t,
+           "until": t + args.duration, "owner_pid": owner_pid, "owner_start": owner_start,
+           "slot": slots.index}
+    write_log(dict(rec, t=t, slot_wait_s=round(slot_wait, 2), mem_wait_s=round(mem_wait, 2)))
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        os.write(w, b"x")
+        os.close(w)
+        try:
+            lease_daemon(slots, rec, t + args.duration, owner_pid, owner_start)
+        finally:
+            os._exit(1)
+    os.close(w)
+    os.read(r, 1)
+    os.close(r)
+    idx = slots.index
+    slots.close_only()       # the lease daemon holds the same open file description; the lock stays
+    for _ in range(50):      # wait for the holder file with the daemon pid
+        h = read_json(slots.holder_path(idx), {}) or {}
+        if h.get("pid") == pid:
+            break
+        time.sleep(0.02)
+    print(f"lease {idx}:{pid} held for {fmt_duration(args.duration)} "
+          f"(release: dingo-pack release {idx}:{pid})")
+    return EXIT_OK
+
+
+def cmd_release(args):
+    owner_pid, _ = owner_process()
+    n = 0
+    for i, h in holders():
+        if h.get("op") != "lease":
+            continue
+        lid = f"{i}:{h.get('pid')}"
+        if args.ids:
+            if lid not in args.ids:
+                continue
+        elif not (owner_pid and h.get("owner_pid") == owner_pid) and h.get("session") != session_label(args):
+            continue
+        try:
+            os.kill(int(h["pid"]), signal.SIGTERM)
+            n += 1
+            print(f"released {lid}")
+        except (OSError, KeyError, ValueError) as e:
+            eprint(f"dingo-pack: cannot release {lid}: {e}")
+    if not n:
+        print("no lease to release")
+    return EXIT_OK
+
+
+def cmd_who(args):
+    cfg = config()
+    n = int(args.slots or cfg.get("slots", 6))
+    total, avail = meminfo()
+    table = proc_table()
+    held = holders()
+    print(f"slots: {len(held)} / {n} held · memory available {fmt_size(avail)} of {fmt_size(total)} "
+          f"· reserve {fmt_size(reserve_bytes(cfg))}")
+    for i, h in held:
+        pid = h.get("job_pid") or h.get("pid")
+        rss = tree_rss(pid, table) if pid else None
+        extra = f" until {hhmm(h['until'])}" if h.get("until") else ""
+        print(f"  [{i}] {h.get('session', '?'):<18} {h.get('op', '?'):<5} {int(now() - h.get('since', now()))} s"
+              f"  est {fmt_size(h.get('est'))} now {fmt_size(rss)}{extra}  {h.get('cmd', '')}")
+    waiting = []
+    for p in glob.glob(os.path.join(sub_dir("waiting"), "*.json")):
+        w = read_json(p, {}) or {}
+        if pid_alive(w.get("pid")):
+            waiting.append(w)
+    for k, w in enumerate(sorted(waiting, key=lambda w: w.get("since", 0)), 1):
+        print(f"  queue #{k} {w.get('session', '?'):<18} waiting {int(now() - w.get('since', now()))} s "
+              f"for {w.get('phase')}  est {fmt_size(w.get('est'))}  {w.get('cmd', '')}")
+    if not held and not waiting:
+        print("  (nobody)")
+    return EXIT_OK
+
+
+def cmd_log(args):
+    try:
+        with open(log_path(), encoding="utf-8") as f:
+            lines = f.readlines()[-args.n:]
+    except OSError:
+        lines = []
+    for line in lines:
+        print(line.rstrip())
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------- roster
+
+DEFAULT_NAME_RE = r"(?<![A-Za-z0-9])([A-Z][0-9]?-\d{4}-[^\s，,。:：;；)）]+)"
+DEFAULT_PROMPT = ("The machine crashed and was restarted. Re-read the end of your log and your last status "
+                  "line, check which steps already finished, then continue the interrupted step without "
+                  "redoing finished work.")
+
+
+def roster_dir():
+    return sub_dir("roster")
+
+
+def first_user_text(path, limit_lines=400):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for k, line in enumerate(f):
+                if k > limit_lines:
+                    break
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain"):
+                    continue
+                c = (d.get("message") or {}).get("content")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+                if isinstance(c, str) and c.strip() and not c.lstrip().startswith("<command-"):
+                    return c
+    except OSError:
+        pass
+    return ""
+
+
+def find_transcript(sid):
+    hits = glob.glob(os.path.join(claude_home(), "projects", "*", f"{sid}.jsonl"))
+    return max(hits, key=lambda p: os.path.getmtime(p)) if hits else None
+
+
+def status_line(cwd, name, pcfg, listing=None):
+    """Last line matching status_regex in the newest file matching log_glob ({name}, {date}).
+
+    `listing` caches directory listings for one roster build: the logs may sit on a slow
+    network / 9p mount, so each directory is listed once, not once per session."""
+    lg, rx = pcfg.get("log_glob"), pcfg.get("status_regex")
+    if not lg or not rx or not name:
+        return None, None
+    rel = lg.replace("{date}", "*")
+    d, base = os.path.split(os.path.join(cwd, rel))
+    listing = {} if listing is None else listing
+    if d not in listing:
+        try:
+            listing[d] = os.listdir(d)
+        except OSError:
+            listing[d] = []
+    import fnmatch
+    pat = base.replace("{name}", glob.escape(name))
+    files = [os.path.join(d, f) for f in listing[d] if fnmatch.fnmatchcase(f, pat)]
+    if not files:
+        return None, None
+    path = max(files, key=lambda p: os.path.getmtime(p))
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return path, None
+    r = re.compile(rx)
+    last = None
+    for line in tail.splitlines():
+        if r.search(line):
+            last = line.strip()
+    return path, last
+
+
+def read_registry():
+    """Claude Code's per-process session files. Returns (entries_by_sid, recognised)."""
+    d = os.path.join(claude_home(), "sessions")
+    out, seen_files, ok_files = {}, 0, 0
+    for p in glob.glob(os.path.join(d, "*.json")):
+        seen_files += 1
+        e = read_json(p)
+        if not isinstance(e, dict) or "sessionId" not in e or "pid" not in e:
+            continue
+        ok_files += 1
+        e["_alive"] = pid_alive(e.get("pid"), e.get("procStart"))
+        sid = e["sessionId"]
+        prev = out.get(sid)
+        key = (e["_alive"], e.get("updatedAt") or 0)
+        if prev is None or key > (prev["_alive"], prev.get("updatedAt") or 0):
+            out[sid] = e
+    return out, (seen_files == 0 or ok_files > 0)
+
+
+def transcripts_fallback(hours=12):
+    out = {}
+    cut = now() - hours * 3600
+    for p in glob.glob(os.path.join(claude_home(), "projects", "*", "*.jsonl")):
+        try:
+            m = os.path.getmtime(p)
+        except OSError:
+            continue
+        if m >= cut:
+            sid = os.path.basename(p)[:-6]
+            out[sid] = {"sessionId": sid, "cwd": None, "_alive": None, "_transcript": p}
+    return out
+
+
+def guess_state(cc_status):
+    return {"busy": "midway", "waiting": "midway", "shell": "midway", "idle": "idle"}.get(cc_status, "unknown")
+
+
+def load_roster():
+    return read_json(os.path.join(roster_dir(), "roster.json"), {"sessions": {}}) or {"sessions": {}}
+
+
+def build_roster(old):
+    reg, recognised = read_registry()
+    fallback = not recognised
+    if fallback:
+        reg = transcripts_fallback()
+    t, bt = now(), boot_time()
+    sessions = dict(old.get("sessions") or {})
+    names_cache = old.get("names") or {}
+    marks_dir = sub_dir("marks")
+    for sid, e in reg.items():
+        s = dict(sessions.get(sid) or {})
+        tr = e.get("_transcript") or find_transcript(sid)
+        cwd = e.get("cwd") or s.get("cwd")
+        if not cwd and tr:
+            cwd = s.get("cwd")
+        name = None
+        if e.get("nameSource") == "user" and e.get("name"):
+            name = e["name"]
+        if not name:
+            name = names_cache.get(sid)
+        if not name and tr:
+            pcfg = local_project_config(cwd) if cwd else {}
+            m = re.search(pcfg.get("name_regex") or DEFAULT_NAME_RE, first_user_text(tr)[:600])
+            if m:
+                name = m.group(1)
+                names_cache[sid] = name
+        name = name or e.get("name") or sid[:8]
+        alive = e.get("_alive")
+        s.update(sid=sid, name=name, cwd=cwd, transcript=tr, pid=e.get("pid"),
+                 cc_status=e.get("status"), registry_recognised=not fallback)
+        if tr:
+            try:
+                s["last_activity"] = os.path.getmtime(tr)
+            except OSError:
+                pass
+        if alive:
+            s["alive"], s["last_seen"] = True, t
+            s.pop("ended", None)
+        elif alive is None:                      # registry not recognised: unknown, keep it
+            s["alive"] = False
+            s.setdefault("ended", "unknown")
+            s["last_seen"] = max(s.get("last_seen") or 0, s.get("last_activity") or 0)
+        elif alive is False:
+            if s.get("alive") or "ended" not in s:
+                # it was alive at our last look (or we never saw it alive): when did it go?
+                ls = s.get("last_seen") or s.get("last_activity") or e.get("updatedAt", 0) / 1000
+                s["last_seen"] = ls
+                s["ended"] = "reboot" if (bt and ls and ls < bt) else "closed"
+            s["alive"] = False
+        mk = read_json(os.path.join(marks_dir, f"{sid}.json"))
+        if mk:
+            s["mark"] = mk
+        sessions[sid] = s
+    # sessions that vanished from the registry entirely
+    for sid, s in sessions.items():
+        if sid not in reg and s.get("alive"):
+            s["alive"] = False
+            s["ended"] = "reboot" if (bt and s.get("last_seen", 0) < bt) else "closed"
+    # prune entries not seen for a week
+    sessions = {k: v for k, v in sessions.items() if t - (v.get("last_seen") or 0) < 7 * 86400}
+    return {"version": 1, "saved_at": t, "boot_time": bt, "host": socket.gethostname(),
+            "registry_recognised": not fallback, "sessions": sessions, "names": names_cache}
+
+
+def state_of(s):
+    mk = s.get("mark") or {}
+    if mk.get("state"):
+        return mk["state"], False
+    return guess_state(s.get("cc_status")), True
+
+
+def render_md(r):
+    lines = [f"# dingo-pack roster · saved {hhmm(r['saved_at'])} on {r.get('host')}", ""]
+    if not r.get("registry_recognised", True):
+        lines += ["> Claude Code session registry not recognised; built from transcripts only.", ""]
+    lines += ["| alive | name | state | until / note | last activity | status line | resume |",
+              "|---|---|---|---|---|---|---|"]
+    rows = sorted(r["sessions"].values(), key=lambda s: (not s.get("alive"), -(s.get("last_activity") or 0)))
+    for s in rows:
+        st, guessed = state_of(s)
+        mk = s.get("mark") or {}
+        note = " ".join(x for x in (mk.get("until") or "", mk.get("note") or "") if x)
+        alive = "yes" if s.get("alive") else f"no ({s.get('ended', '?')})"
+        cmd = f"cd {shlex.quote(s.get('cwd') or '.')} && claude --resume {s['sid']}"
+        sl = (s.get("status_line") or "").replace("|", "\\|")[:160]
+        lines.append(f"| {alive} | {s.get('name')} | {st}{' (guessed)' if guessed else ''} | {note} | "
+                     f"{hhmm(s.get('last_activity'))} | {sl} | `{cmd}` |")
+    return "\n".join(lines) + "\n"
+
+
+def save_roster(quiet=False, min_gap=0.0):
+    rd = roster_dir()
+    lk = os.open(os.path.join(rd, "lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return None          # someone else is saving right now; their snapshot will do
+        old = load_roster()
+        if min_gap and now() - (old.get("saved_at") or 0) < min_gap:
+            return old
+        r = build_roster(old)
+        body = json.dumps(r, ensure_ascii=False, indent=1, sort_keys=True)
+        write_atomic(os.path.join(rd, "roster.json"), body)
+        write_atomic(os.path.join(rd, "roster.md"), render_md(r))
+        sig = json.dumps({k: (v.get("alive"), v.get("cc_status"), (v.get("mark") or {}).get("state"),
+                              v.get("status_line")) for k, v in r["sessions"].items()}, sort_keys=True)
+        sigp = os.path.join(rd, "last.sig")
+        try:
+            with open(sigp) as f:
+                same = f.read() == sig
+        except OSError:
+            same = False
+        if not same:
+            snaps = sub_dir(os.path.join("roster", "snapshots"))
+            write_atomic(os.path.join(snaps, time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}.json"), body)
+            write_atomic(sigp, sig)
+            keep = int(os.environ.get("DINGO_KEEP_SNAPSHOTS", "20"))
+            for old_snap in sorted(glob.glob(os.path.join(snaps, "*.json")))[:-keep]:
+                try:
+                    os.unlink(old_snap)
+                except OSError:
+                    pass
+    finally:
+        os.close(lk)
+    r = add_status_lines(r) or r
+    if not quiet:
+        alive = sum(1 for s in r["sessions"].values() if s.get("alive"))
+        print(f"roster saved: {alive} alive, {len(r['sessions'])} known -> {os.path.join(rd, 'roster.md')}")
+    return r
+
+
+def add_status_lines(r):
+    """Phase 2 of a save: read status lines from project logs (possibly on a network mount).
+    Runs *without* the roster lock, so a read stuck on a hung mount cannot freeze the roster;
+    a second lock keeps at most one such reader alive. Results are merged under the roster lock."""
+    rd = roster_dir()
+    nl = os.open(os.path.join(rd, "netlock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(nl, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return None                     # another reader is busy (or stuck); skip
+        listing, found = {}, {}
+        for sid, s in r["sessions"].items():
+            if not s.get("alive") and s.get("status_line"):
+                continue                    # keep the last line we read while it was alive
+            cwd, name = s.get("cwd"), s.get("name")
+            if cwd and name:
+                lp, line = status_line(cwd, name, project_config(cwd), listing)
+                if lp and (line is not None or not s.get("status_line")):
+                    found[sid] = (lp, line)      # a read error keeps the last good line
+        if not found:
+            return None
+        lk = os.open(os.path.join(rd, "lock"), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            try:
+                fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return None
+            cur = load_roster()
+            changed = False
+            for sid, (lp, line) in found.items():
+                s = cur["sessions"].get(sid)
+                if s is not None and (s.get("log"), s.get("status_line")) != (lp, line):
+                    s["log"], s["status_line"] = lp, line
+                    changed = True
+            if changed:
+                write_atomic(os.path.join(rd, "roster.json"),
+                             json.dumps(cur, ensure_ascii=False, indent=1, sort_keys=True))
+                write_atomic(os.path.join(rd, "roster.md"), render_md(cur))
+            return cur
+        finally:
+            os.close(lk)
+    finally:
+        os.close(nl)
+
+
+def cmd_save(args):
+    if args.hook:
+        # Called from a Claude Code hook on every turn: return at once, never fail, never print.
+        # The save itself runs in a detached child, so a hung network mount (status lines are
+        # read from the project's logs) can never stall the agent's turn.
+        try:
+            sys.stdin.read()
+        except (OSError, ValueError):
+            pass
+        if os.environ.get("DINGO_HOOK_FOREGROUND") != "1":
+            try:
+                if os.fork() > 0:
+                    return EXIT_OK
+            except OSError:
+                return EXIT_OK
+            os.setsid()
+            devnull = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(devnull, fd)
+        rc = EXIT_OK
+        try:
+            signal.signal(signal.SIGALRM, _alarm)
+            signal.alarm(int(os.environ.get("DINGO_HOOK_MAX_S", "30")))
+            save_roster(quiet=True, min_gap=float(os.environ.get("DINGO_HOOK_MIN_GAP_S", "15")))
+        except BaseException as e:  # noqa: BLE001 - a hook must not break the agent's turn
+            try:
+                write_log({"t": now(), "op": "save-hook-error", "error": repr(e)[:300]})
+            except Exception:       # noqa: BLE001
+                pass
+        if os.environ.get("DINGO_HOOK_FOREGROUND") != "1":
+            os._exit(rc)
+        return rc
+    check_local_state()
+    if args.every:
+        while True:
+            save_roster(quiet=True)
+            time.sleep(args.every)
+    save_roster(quiet=False)
+    return EXIT_OK
+
+
+def my_session_id(args):
+    sid = getattr(args, "sid", None) or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid:
+        return sid
+    pid, _ = owner_process()
+    if pid:
+        e = read_json(os.path.join(claude_home(), "sessions", f"{pid}.json"), {}) or {}
+        return e.get("sessionId")
+    return None
+
+
+def cmd_mark(args):
+    sid = my_session_id(args)
+    if not sid:
+        eprint("dingo-pack mark: cannot tell which session this is (no CLAUDE_CODE_SESSION_ID); pass --sid")
+        return EXIT_USAGE
+    if args.state == "waiting" and not args.until:
+        eprint("dingo-pack mark waiting: tip: add --until WHEN so `list` can sort by when to resume")
+    state = "midway" if args.state == "running" else args.state
+    rec = {"state": state, "until": args.until, "note": " ".join(args.note)[:300], "t": now()}
+    write_atomic(os.path.join(sub_dir("marks"), f"{sid}.json"), json.dumps(rec, ensure_ascii=False))
+    save_roster(quiet=True)
+    print(f"marked {sid[:8]} {state}" + (f" until {args.until}" if args.until else ""))
+    return EXIT_OK
+
+
+GROUPS = [("midway", "🔴 midway - resume now"), ("waiting", "⏰ waiting for a time - resume when due"),
+          ("blocked", "⛔ blocked on a person"), ("idle", "💤 idle (no self-report) - check before resuming"),
+          ("unknown", "❔ unknown"), ("done", "✅ done - no need to resume")]
+
+
+UNTIL_TIME = re.compile(r"(\d{1,2})[:：.](\d{2})")
+
+
+def until_key(until):
+    """Sort key for --until text: times of day first (earliest first), then other text, then none.
+    Only the first HH:MM in the text is used; the day is not parsed."""
+    if not until:
+        return (2, 0, "")
+    m = UNTIL_TIME.search(until)
+    if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:
+        return (0, int(m.group(1)) * 60 + int(m.group(2)), until)
+    return (1, 0, until)
+
+
+def select(r, since_h, include_closed):
+    cut = now() - since_h * 3600
+    out = []
+    for s in r["sessions"].values():
+        if (s.get("last_seen") or 0) < cut:
+            continue
+        if s.get("alive"):
+            continue
+        if s.get("ended") == "closed" and not include_closed:
+            continue
+        out.append(s)
+    return out
+
+
+def cmd_list(args):
+    r = save_roster(quiet=True) if not args.no_refresh else load_roster()
+    if r is None:
+        r = load_roster()
+    if args.at:
+        snaps = sorted(glob.glob(os.path.join(roster_dir(), "snapshots", "*.json")))
+        pick = [p for p in snaps if os.path.basename(p)[:15].replace("-", "") <= args.at.replace("-", "").replace(":", "")]
+        if pick:
+            r = read_json(pick[-1], r)
+    rows = select(r, args.since, args.closed)
+    alive_now = [s for s in r["sessions"].values() if s.get("alive")]
+    if args.json:
+        print(json.dumps({"lost": rows, "alive": alive_now}, ensure_ascii=False, indent=1))
+        return EXIT_OK
+    print(f"roster {hhmm(r.get('saved_at'))} · {len(alive_now)} alive now · {len(rows)} not running "
+          f"(seen in the last {args.since:g} h{', incl. closed' if args.closed else ''})")
+    if not r.get("registry_recognised", True):
+        print("  ⚠ Claude Code session registry not recognised; names / cwd may be missing")
+    for key, title in GROUPS:
+        grp = [s for s in rows if state_of(s)[0] == key]
+        if not grp:
+            continue
+        print(f"\n{title}")
+        grp.sort(key=lambda s: (until_key((s.get("mark") or {}).get("until")), -(s.get("last_activity") or 0)))
+        for s in grp:
+            st, guessed = state_of(s)
+            mk = s.get("mark") or {}
+            bits = [f"  {s.get('name', '?'):<24} last {hhmm(s.get('last_activity'))}",
+                    f"ended {s.get('ended', '?')}"]
+            if guessed:
+                bits.append(f"(guessed from '{s.get('cc_status')}')")
+            if mk.get("until"):
+                bits.append(f"until {mk['until']}")
+            print(" · ".join(bits))
+            if mk.get("note"):
+                print(f"      note: {mk['note']}")
+            if s.get("status_line"):
+                print(f"      status: {s['status_line'][:150]}")
+            print(f"      cd {shlex.quote(s.get('cwd') or '.')} && claude --resume {s['sid']}")
+    if alive_now:
+        print("\nalive now: " + ", ".join(sorted(s.get("name", "?") + ("" if s.get("transcript") else " (empty)")
+                                               for s in alive_now)))
+    return EXIT_OK
+
+
+def launcher(s, prompt):
+    d = sub_dir("resume")
+    path = os.path.join(d, f"{s['sid']}.sh")
+    claude = os.environ.get("DINGO_CLAUDE_BIN", "claude")
+    body = ("#!/bin/bash\n"
+            f"# dingo-pack resume {s.get('name')} ({hhmm(now())})\n"
+            f"cd {shlex.quote(s.get('cwd') or os.path.expanduser('~'))} || exit 1\n"
+            f"exec {shlex.quote(claude)} --resume {shlex.quote(s['sid'])} {shlex.quote(prompt)}\n")
+    write_atomic(path, body)
+    os.chmod(path, 0o755)
+    return path
+
+
+def pick_via(v):
+    if v:
+        return v
+    if os.environ.get("WSL_DISTRO_NAME") and shutil.which("wt.exe"):
+        return "wt"
+    if os.environ.get("TMUX") and shutil.which("tmux"):
+        return "tmux"
+    return "print"
+
+
+def open_tab(via, s, path):
+    title = re.sub(r"[^\w.\-]", "_", s.get("name") or s["sid"][:8])
+    if via == "wt":
+        argv = ["wt.exe", "-w", "0", "nt", "--title", title, "wsl.exe", "-d",
+                os.environ.get("WSL_DISTRO_NAME", ""), "--", "bash", "-l", path]
+    elif via == "tmux":
+        argv = ["tmux", "new-window", "-n", title, "bash", "-l", path]
+    else:
+        print(f"  bash -l {shlex.quote(path)}    # {s.get('name')}")
+        return 0
+    return subprocess.run(argv).returncode
+
+
+def cmd_resume(args):
+    r = save_roster(quiet=True) or load_roster()
+    rows = select(r, args.since, True)
+    if args.names:
+        want = set(args.names)
+        rows = [s for s in r["sessions"].values() if s.get("name") in want or s["sid"] in want
+                or s["sid"][:8] in want]
+        missing = want - {s.get("name") for s in rows} - {s["sid"] for s in rows} - {s["sid"][:8] for s in rows}
+        for m in sorted(missing):
+            eprint(f"dingo-pack: {m}: not in the roster")
+    elif args.midway:
+        rows = [s for s in rows if s.get("ended") != "closed" and state_of(s)[0] == "midway"]
+    elif args.lost:
+        rows = [s for s in rows if s.get("ended") != "closed" and state_of(s)[0] != "done"]
+    else:
+        eprint("dingo-pack resume: name sessions, or say --midway / --lost")
+        return EXIT_USAGE
+    reg, _ = read_registry()
+    todo = []
+    for s in sorted(rows, key=lambda s: -(s.get("last_activity") or 0)):
+        e = reg.get(s["sid"])
+        if e and e.get("_alive"):
+            print(f"skip {s.get('name')}: already running (pid {e.get('pid')})")
+            continue
+        if not s.get("transcript") or not os.path.exists(s["transcript"]):
+            eprint(f"skip {s.get('name')}: transcript not found")
+            continue
+        todo.append(s)
+    if not todo:
+        print("nothing to resume")
+        return EXIT_OK
+    via = "print" if args.dry_run else pick_via(args.via)
+    batch = max(1, int(args.batch or config().get("resume_batch", 4)))
+    gap = float(os.environ.get("DINGO_RESUME_GAP_S", "5"))
+    print(f"resuming {len(todo)} via {via}, {batch} at a time")
+    for k, s in enumerate(todo):
+        if k and k % batch == 0:
+            rest = ", ".join(x.get("name", "?") for x in todo[k:])
+            if args.yes:
+                pass
+            elif sys.stdin.isatty():
+                input(f"next batch: {rest} - press Enter to continue (Ctrl-C to stop) ")
+            else:
+                print(f"stopped after a batch of {batch}; still to resume: {rest}")
+                return EXIT_OK
+        prompt = args.prompt or project_config(s.get("cwd") or ".").get("resume_prompt") or DEFAULT_PROMPT
+        path = launcher(s, prompt)
+        print(f"  {s.get('name')}: {s['sid']} in {s.get('cwd')}")
+        rc = open_tab(via, s, path)
+        if rc:
+            eprint(f"dingo-pack: opening a tab for {s.get('name')} failed (exit {rc}); run: bash -l {path}")
+        write_log({"t": now(), "op": "resume", "session": s.get("name"), "sid": s["sid"], "via": via, "rc": rc})
+        if via != "print" and k + 1 < len(todo):
+            time.sleep(gap)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------- main
+
+DINGO = r"""
+        /|
+  ~\___/ o\_
+    (      __)   dingo-pack: the pack eats in order
+     |_|--|_|
+"""
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="dingo-pack", description=DINGO + "\n" + __doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"dingo-pack {__version__}")
+    sp = p.add_subparsers(dest="sub")
+
+    def common(q):
+        q.add_argument("--session", help="label for who / log (default: Claude Code session id)")
+        q.add_argument("--slots", type=int, help="number of heavy slots (default 6 / DINGO_SLOTS)")
+        q.add_argument("--timeout", type=parse_duration, default=None,
+                       help="give up (exit 75) after this long waiting, e.g. 30m")
+
+    q = sp.add_parser("run", help="run a heavy command in a slot, under memory limits")
+    common(q)
+    q.add_argument("--heavy", action="store_true", required=False)
+    q.add_argument("--mem", type=parse_size, help="expected peak memory, e.g. 6G (default 2G)")
+    q.add_argument("--limit", type=parse_size, help="per-process limit (default 1.5 x --mem; 0 = none)")
+    q.add_argument("--limit-kind", choices=("data", "as"), default="data")
+    q.add_argument("--tree-limit", type=parse_size, help="limit on the whole process tree (default = --limit; 0 = none)")
+    q.add_argument("cmd", nargs=argparse.REMAINDER)
+
+    q = sp.add_parser("lease", help="hold a slot for work that is not a shell command")
+    common(q)
+    q.add_argument("--heavy", action="store_true")
+    q.add_argument("--mem", type=parse_size)
+    q.add_argument("--for", dest="duration", type=parse_duration, default=45 * 60.0)
+    q.add_argument("--note", default="")
+
+    q = sp.add_parser("release", help="release leases")
+    q.add_argument("--session")
+    q.add_argument("ids", nargs="*")
+
+    q = sp.add_parser("who", help="slot holders and the queue")
+    q.add_argument("--slots", type=int)
+    q = sp.add_parser("log", help="recent log lines")
+    q.add_argument("-n", type=int, default=20)
+
+    q = sp.add_parser("save", help="snapshot live Claude Code sessions to the roster")
+    q.add_argument("--hook", action="store_true", help="hook mode: silent, never fails, rate-limited")
+    q.add_argument("--every", type=float, help="keep saving every N seconds")
+
+    q = sp.add_parser("mark", help="self-report this session's state")
+    q.add_argument("state", choices=STATES)
+    q.add_argument("--until", help="for waiting: when to resume")
+    q.add_argument("--sid", help="session id (default: this Claude Code session)")
+    q.add_argument("note", nargs="*")
+
+    q = sp.add_parser("list", help="sessions to resume, grouped")
+    q.add_argument("--since", type=float, default=24.0, help="hours (default 24)")
+    q.add_argument("--closed", action="store_true", help="also show sessions closed while the machine was up")
+    q.add_argument("--at", help="use the newest snapshot not later than YYYYMMDD-HHMMSS")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("--no-refresh", action="store_true")
+
+    q = sp.add_parser("resume", help="reopen sessions from the roster")
+    q.add_argument("names", nargs="*")
+    q.add_argument("--midway", action="store_true", help="all lost sessions marked / guessed midway")
+    q.add_argument("--lost", action="store_true", help="all sessions lost in a reboot except done")
+    q.add_argument("--since", type=float, default=24.0)
+    q.add_argument("--via", choices=("wt", "tmux", "print"))
+    q.add_argument("--batch", type=int, help="tabs per batch (default 4)")
+    q.add_argument("--prompt", help="first message for each resumed session")
+    q.add_argument("--yes", action="store_true", help="do not pause between batches")
+    q.add_argument("--dry-run", action="store_true")
+
+    args = p.parse_args(argv)
+    if args.sub and not (args.sub == "save" and getattr(args, "hook", False)):
+        check_local_state()
+    fn = {"run": cmd_run, "lease": cmd_lease, "release": cmd_release, "who": cmd_who, "log": cmd_log,
+          "save": cmd_save, "mark": cmd_mark, "list": cmd_list, "resume": cmd_resume}.get(args.sub)
+    if not fn:
+        p.print_help()
+        return EXIT_USAGE
+    return fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
