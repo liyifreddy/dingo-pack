@@ -1,0 +1,37 @@
+name: test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  posix:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        python: ['3.8', '3.12']
+        include:
+          - os: macos-latest
+            python: '3.12'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Portable smoke and failure diagnostics
+        run: python selftest_release.py --portable
+      - name: Full Linux regression
+        if: runner.os == 'Linux'
+        run: python selftest_dingo_pack.py
+  windows-boundary:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Native Windows gives an actionable unsupported-platform message
+        shell: pwsh
+        run: |
+          $output = python bin/dingo-pack --version 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 2 -or $output -notmatch 'inside WSL2') { throw $output }
+          exit 0

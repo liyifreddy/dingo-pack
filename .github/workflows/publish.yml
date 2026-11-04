@@ -1,4 +1,4 @@
-# Publish to PyPI when a GitHub Release is published (PyPI Trusted Publishing: no API token).
+# Build and validate before the protected, token-free publishing job.
 name: publish
 on:
   release:
@@ -6,18 +6,36 @@ on:
 permissions:
   contents: read
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Self-test
+        run: uv run --no-project python selftest_dingo_pack.py
+      - name: Build and validate distributions
+        run: |
+          uv build
+          uvx twine check dist/*
+          uv run --no-project python selftest_release.py --artifacts dist
+      - name: Check the version matches the release tag
+        run: |
+          v=$(uv run --no-project python bin/dingo-pack --version | awk '{print $2}')
+          test "v$v" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != package version $v"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error
   pypi:
+    needs: build
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-      - name: Build
-        run: uv build
-      - name: Check the version matches the release tag
-        run: |
-          v=$(ls dist/*.tar.gz | sed -E 's/.*-([0-9][^-]*)\.tar\.gz/\1/')
-          test "v$v" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != package version $v"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1

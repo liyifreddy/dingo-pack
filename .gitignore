@@ -1,2 +1,9 @@
-__pycache__/
+# 本地验证产物；公开分发另用 pyproject 的显式清单。
+.venv*/
 dist/
+__pycache__/
+*.pyc
+*.log
+validation*/
+core
+core.*

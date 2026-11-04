@@ -7,20 +7,32 @@ machine take turns at heavy work (test suites, model loads, big builds) instead 
 starting them all at once and running the machine out of memory, and keeps a
 roster of the agent sessions so that after a crash you can bring the whole pack back.
 
-Slots and memory:
+Everyday (like a browser's tab saver):
+  dingo-pack save                  remember the open sessions (the hooks do this by themselves)
+  dingo-pack close-all             remember them and close the ones that are idle and waiting / done
+  dingo-pack restore [NAME...]     bring back the last batch: what close-all closed, or what a crash lost
+
+Advanced -- slots and memory:
   dingo-pack run --heavy [--mem 6G] [--limit 9G] [--tree-limit 9G] -- CMD...
                                    wait for a slot + enough free memory, run CMD under limits
   dingo-pack lease [--mem 4G] [--for 45m] [--note TEXT]
                                    hold a slot for work you cannot wrap (an in-agent review, ...)
   dingo-pack release [LEASE_ID...] release your leases (default: all of this session's)
   dingo-pack who                   who holds slots, who is queuing, memory now
+  dingo-pack run --io -- CMD...    big reads / writes on a slow disk, in their own lane (1 slot)
+  dingo-pack top [--watch S]       memory by session
+  dingo-pack doctor                one checkup: memory, OOM kills, mounts, WSL, slots, roster, ghosts
+  dingo-pack ghosts [--reap]       processes whose session is gone (reap: humans only)
   dingo-pack log [-n N]            recent job lines
 
-Roster (Claude Code sessions):
+Advanced -- roster (Claude Code sessions):
   dingo-pack save [--hook] [--every SECONDS]   snapshot live sessions to a local roster
   dingo-pack mark STATE [--until WHEN] [NOTE]  self-report: running (= midway) | waiting | blocked | done
   dingo-pack list [--since HOURS] [--json]     sessions from the roster, grouped for resuming
   dingo-pack resume NAME... | --midway | --lost [--via wt|tmux|print] [--yes] [--dry-run]
+  dingo-pack stow [--close]        note live sessions; --close closes idle waiting / done ones (humans)
+  dingo-pack unstow                reopen what stow closed
+  dingo-pack                       one-screen overview
 
 Standard library only. Python >= 3.8, Linux/macOS/WSL (needs fcntl).
 """
@@ -28,7 +40,13 @@ from __future__ import annotations
 
 import argparse
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    import sys
+    print("dingo-pack: native Windows is not supported (POSIX fcntl is required). "
+          "Run Python and dingo-pack inside WSL2 or use Linux/macOS.", file=sys.stderr)
+    raise SystemExit(2)
 import glob
 import json
 import os
@@ -41,7 +59,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.1.1"
+__version__ = "0.4.1"
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -87,7 +105,18 @@ def sub_dir(name):
 
 
 def claude_home():
-    return os.environ.get("DINGO_CLAUDE_HOME") or os.path.expanduser("~/.claude")
+    return (os.environ.get("DINGO_CLAUDE_HOME") or os.environ.get("CLAUDE_CONFIG_DIR")
+            or os.path.expanduser("~/.claude"))
+
+
+AGENT_MARKERS = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
+                 "WOMBAT_NO_ESCAPES", "DINGO_NO_ESCAPES")
+
+
+def is_agent():
+    """True if this process looks like it was started by an AI agent (any marker set to
+    something other than empty or 0). Used to keep `stow --close` and `ghosts --reap` human-only."""
+    return any(os.environ.get(k, "") not in ("", "0") for k in AGENT_MARKERS)
 
 
 def fs_type(path):
@@ -333,6 +362,13 @@ def pid_alive(pid, start=None):
         pass
     except (OSError, ValueError):
         return False
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            st = f.read()
+        if st[st.rindex(")") + 2:].split()[0] in ("Z", "X"):
+            return False           # exited, not yet reaped by its parent
+    except (OSError, ValueError, IndexError):
+        pass
     if start not in (None, ""):
         cur = proc_start(int(pid))
         if cur is not None and str(cur) != str(start):
@@ -377,12 +413,67 @@ def _alarm(signum, frame):
     raise Deadline()
 
 
+LANE_DIRS = {"heavy": "slots", "io": "io-slots"}
+BACKFILL_MAX = int(os.environ.get("DINGO_BACKFILL_MAX", "3"))
+THREAD_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+               "NUMEXPR_MAX_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS")
+DEFAULT_THREADS = {"heavy": 8, "io": 1, "lease": 2}
+
+
+def cpu_total(cfg=None):
+    cfg = cfg if cfg is not None else config()
+    v = os.environ.get("DINGO_CPU_SLOTS") or cfg.get("cpu_slots")
+    return int(v) if v else (os.cpu_count() or 1)
+
+
+def cpu_used(exclude=None):
+    """CPU slots taken by admitted holders (each counts its --threads)."""
+    used = 0
+    for i, h in holders():
+        if (h.get("lane"), i) == exclude or h.get("op") == "waiting for memory":
+            continue
+        used += int(h.get("threads") or 0)
+    return used
+
+
+def loadavg():
+    try:
+        with open(os.environ.get("DINGO_FAKE_LOADAVG", "/proc/loadavg")) as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def n_cpus():
+    return int(os.environ.get("DINGO_FAKE_NCPU") or os.cpu_count() or 1)
+
+
+def clear_memhead(pid):
+    path = os.path.join(state_dir(), "memhead.json")
+    h = read_json(path)
+    if h and h.get("pid") == pid:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def lane_size(lane, cfg, override=None):
+    if override:
+        return int(override)
+    if lane == "io":
+        return int(os.environ.get("DINGO_IO_SLOTS") or cfg.get("io_slots", 1))
+    return int(cfg.get("slots", 6))
+
+
 class Slots:
     """N flock'ed slot files plus one queue lock; the head of the queue is always served next."""
 
-    def __init__(self, n):
+    def __init__(self, n, lane="heavy", threads=0):
         self.n = max(1, int(n))
-        self.dir = sub_dir("slots")
+        self.lane = lane
+        self.threads = int(threads or 0)
+        self.dir = sub_dir(LANE_DIRS[lane])
         self.qfd = None
         self.fd = None
         self.index = None
@@ -431,8 +522,12 @@ class Slots:
     def acquire(self, est, reserve, timeout, waiting_rec, quiet=False):
         """Block until we hold a slot and memory admits `est` bytes. Returns (slot_wait_s, mem_wait_s).
 
-        The holder record (with `est`) is written *before* the queue lock is dropped, so the
-        next one in line already counts our promised memory when it checks admission."""
+        Slots go first come first served (queue lock). The queue lock is dropped as soon as we
+        have a slot, so jobs behind us can take the next slots. Memory admission is a separate
+        step, serialised by one lock: whoever is admitted writes its holder record ("starting",
+        with its estimate) before that lock is released, so the next check counts it. A job that
+        fits may go ahead of one waiting for memory (backfill), but the one waiting -- the
+        memory head -- can be passed at most BACKFILL_MAX times; after that everybody waits."""
         deadline = now() + timeout if timeout else None
         wpath = os.path.join(sub_dir("waiting"), f"{os.getpid()}.json")
         write_atomic(wpath, json.dumps(dict(waiting_rec, pid=os.getpid(), since=now(), phase="queue")))
@@ -449,9 +544,13 @@ class Slots:
                 time.sleep(0.2)
             t1 = now()
             write_atomic(wpath, json.dumps(dict(waiting_rec, pid=os.getpid(), since=t0, phase="memory")))
+            self.write_holder(dict(waiting_rec, pid=os.getpid(), start=proc_start(os.getpid()), since=now(),
+                                   op="waiting for memory"))
+            os.close(self.qfd)          # the next in line may take the next slot meanwhile
+            self.qfd = None
             noted = 0.0
             while True:
-                ok, why = admit(est, reserve, exclude=self.index, n=self.n)
+                ok, why = self._admit_step(est, reserve)
                 if ok:
                     break
                 if deadline and now() > deadline:
@@ -460,9 +559,9 @@ class Slots:
                     eprint(f"dingo-pack: waiting for memory: {why}")
                     noted = now()
                 time.sleep(float(os.environ.get("DINGO_MEM_POLL_S", "2")))
-            self.write_holder(dict(waiting_rec, pid=os.getpid(), since=now(), op="starting"))
             return t1 - t0, now() - t1
         except BaseException:
+            clear_memhead(os.getpid())
             self.release()
             raise
         finally:
@@ -473,6 +572,45 @@ class Slots:
             if self.qfd is not None:
                 os.close(self.qfd)      # closing drops the queue flock; the next in line goes
                 self.qfd = None
+
+    def _admit_step(self, est, reserve):
+        """One admission attempt under the admission lock. Returns (admitted, why_not)."""
+        me, start = os.getpid(), proc_start(os.getpid())
+        lk = os.open(os.path.join(state_dir(), "admit.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            path = os.path.join(state_dir(), "memhead.json")
+            head = read_json(path)
+            if head and not pid_alive(head.get("pid"), head.get("start")):
+                head = None
+            ok, why = admit(est, reserve, exclude=(self.lane, self.index), n=self.n)
+            if ok and self.threads:
+                total, used = cpu_total(), cpu_used(exclude=(self.lane, self.index))
+                if used + self.threads > total:
+                    ok, why = False, f"CPU slots: {used} of {total} taken, this job needs {self.threads}"
+            mine = bool(head) and head.get("pid") == me
+            if ok and head and not mine:
+                if head.get("skips", 0) >= BACKFILL_MAX:
+                    ok, why = False, (f"{head.get('session', '?')} has waited for memory and was passed "
+                                      f"{head.get('skips')} times; it goes first")
+                else:
+                    head["skips"] = head.get("skips", 0) + 1         # we go ahead of it (backfill)
+                    write_atomic(path, json.dumps(head))
+            if ok:
+                if mine:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                self.write_holder(dict(read_json(self.holder_path(self.index), {}) or {}, pid=me, start=start,
+                                       since=now(), op="starting"))
+            elif not head:
+                write_atomic(path, json.dumps({"pid": me, "start": start, "est": est, "skips": 0, "since": now(),
+                                               "session": (read_json(self.holder_path(self.index), {}) or {})
+                                               .get("session")}))
+            return ok, why
+        finally:
+            os.close(lk)
 
     def write_holder(self, rec):
         write_atomic(self.holder_path(self.index), json.dumps(rec))
@@ -511,19 +649,25 @@ def slot_held(path):
         os.close(fd)
 
 
-def holders(n=None):
-    """[(index, holder_record)] for slots that are actually held (any index on disk)."""
-    d = sub_dir("slots")
+def holders(lane=None):
+    """[(index, holder_record)] for slots that are actually held, in one lane or all of
+    them; each record carries its "lane"."""
     out = []
-    for p in sorted(glob.glob(os.path.join(d, "slot-*"))):
-        if p.endswith(".holder") or ".tmp." in p:
+    for ln, sub in LANE_DIRS.items():
+        if lane and ln != lane:
             continue
-        try:
-            i = int(p.rsplit("-", 1)[1])
-        except ValueError:
-            continue
-        if slot_held(p):
-            out.append((i, read_json(p + ".holder", {}) or {}))
+        d = sub_dir(sub)
+        for p in sorted(glob.glob(os.path.join(d, "slot-*"))):
+            if p.endswith(".holder") or ".tmp." in p:
+                continue
+            try:
+                i = int(p.rsplit("-", 1)[1])
+            except ValueError:
+                continue
+            if slot_held(p):
+                h = read_json(p + ".holder", {}) or {}
+                h["lane"] = ln
+                out.append((i, h))
     return out
 
 
@@ -534,17 +678,28 @@ def admit(est, reserve, exclude=None, n=None):
         return True, "memory unknown on this platform; admitting"
     table = proc_table()
     unmet = 0
-    for i, h in holders():
-        if i == exclude:
-            continue
+    for i, h in holders():                 # memory is shared by every lane
+        if (h.get("lane"), i) == exclude or h.get("op") == "waiting for memory":
+            continue                       # not admitted yet: promises nothing
         jp = h.get("job_pid")              # starting / lease: nothing of ours is using it yet
-        e = h.get("est") or 0
         used = tree_rss(jp, table) if jp else 0
-        unmet += max(0, e - used)
+        unmet += max(0, commitment(h) - used)
     need = est + reserve
     ok = avail - unmet >= need
     return ok, (f"available {fmt_size(avail)} - promised to running jobs {fmt_size(unmet)} "
                 f"< need {fmt_size(est)} + reserve {fmt_size(reserve)}")
+
+
+PEAK_AFTER_S = float(os.environ.get("DINGO_PEAK_AFTER_S", "60"))
+
+
+def commitment(h):
+    """How much memory a holder is counted for: its estimate until it has run PEAK_AFTER_S,
+    then 1.2 x the peak actually measured (a job that said 2G but uses 300M stops blocking others)."""
+    est = h.get("est") or 0
+    if h.get("job_pid") and h.get("peak") and now() - (h.get("job_since") or now()) >= PEAK_AFTER_S:
+        return int(h["peak"] * 1.2)
+    return est
 
 
 def reserve_bytes(cfg):
@@ -582,7 +737,7 @@ def write_log(rec):
 # ---------------------------------------------------------------- run / lease
 
 def resolve_sizes(args, cfg):
-    est = args.mem if args.mem is not None else parse_size(cfg.get("default_mem", "2G"))
+    est = args.mem if args.mem is not None else parse_size(cfg.get("default_mem", "1G"))
     limit = args.limit if args.limit is not None else int(est * 1.5)
     tree = args.tree_limit if getattr(args, "tree_limit", None) is not None else limit
     return est, limit, tree
@@ -604,9 +759,40 @@ def kill_tree(root, sig):
             pass
 
 
+def memory_diagnostic(raw_rc, limit, tree, kind, stopped, peak):
+    """Describe evidence without treating every failure or SIGSEGV as an OOM."""
+    sig = -raw_rc if raw_rc < 0 else raw_rc - 128 if raw_rc in (137, 139) else None
+    if sig is not None:
+        try:
+            signal_name = signal.Signals(sig).name
+        except ValueError:
+            signal_name = "unknown"
+        exit_info = f"{sig} ({signal_name})"
+        if raw_rc >= 0:
+            exit_info += "; inferred from shell exit status"
+    else:
+        exit_info = "none"
+    if stopped:
+        cause = "process-tree limit exceeded (confirmed by dingo-pack)"
+    elif limit and raw_rc in (-9, -11, 137, 139):
+        cause = "possible memory limit hit; the exit alone does not prove OOM"
+    elif raw_rc in (-9, -11, 137, 139):
+        cause = "possible system OOM or another signal source; check system logs"
+    else:
+        cause = "cause unknown; check the child's error (e.g. MemoryError / allocation failure)"
+    return (f"dingo-pack: memory diagnostic: configured per-process {kind} limit={fmt_size(limit)}; "
+            f"tree limit={fmt_size(tree)}; sampled tree peak={fmt_size(peak)}; "
+            f"exit signal={exit_info}; child exit={raw_rc}. {cause}. "
+            "For a large CSV, try chunked reading; check available memory before raising --mem/--limit. "
+            "RLIMIT_DATA/AS is not RSS; a short allocation spike may fall between samples.")
+
+
 def cmd_run(args):
-    if not args.heavy:
-        eprint("dingo-pack: say --heavy (only heavy jobs are queued; light ones need no dingo-pack)")
+    if not args.heavy and not args.io:
+        eprint("dingo-pack: say --heavy (CPU / memory) or --io (big reads and writes on a slow disk)")
+        return EXIT_USAGE
+    if args.heavy and args.io:
+        eprint("dingo-pack: --heavy or --io, not both")
         return EXIT_USAGE
     cmd = args.cmd
     if cmd and cmd[0] == "--":
@@ -616,16 +802,23 @@ def cmd_run(args):
         return EXIT_USAGE
     check_local_state()
     cfg = config()
+    lane = "io" if args.io else "heavy"
+    if lane == "io" and args.mem is None:
+        args.mem = parse_size(cfg.get("io_default_mem", "512M"))
     est, limit, tree = resolve_sizes(args, cfg)
     reserve = reserve_bytes(cfg)
     check_fits(est, reserve)
-    slots = Slots(args.slots or cfg.get("slots", 6))
+    threads = args.threads if args.threads is not None else DEFAULT_THREADS[lane]
+    if threads > cpu_total(cfg):
+        eprint(f"dingo-pack: --threads {threads} is more than this machine's {cpu_total(cfg)} CPU slots")
+        return EXIT_USAGE
+    slots = Slots(lane_size(lane, cfg, args.slots), lane, threads)
     who = session_label(args)
-    rec = {"t": now(), "op": "run", "session": who, "cmd": cmd_summary(cmd), "est": est,
+    rec = {"t": now(), "op": "run", "lane": lane, "threads": threads, "session": who, "cmd": cmd_summary(cmd), "est": est,
            "limit": limit, "tree_limit": tree, "host": socket.gethostname()}
     try:
         slot_wait, mem_wait = slots.acquire(est, reserve, args.timeout,
-                                            {"session": who, "cmd": rec["cmd"], "est": est})
+                                            {"session": who, "cmd": rec["cmd"], "est": est, "threads": threads})
     except Deadline:
         rec.update(rc=EXIT_TIMEOUT, error="timeout waiting for a slot / memory")
         write_log(rec)
@@ -648,15 +841,21 @@ def cmd_run(args):
     try:
         # The job inherits the slot lock: if dingo-pack itself is killed, the slot stays
         # taken until the job is gone too.
-        child = subprocess.Popen(cmd, preexec_fn=preexec, close_fds=True, pass_fds=(slots.fd,))
+        env = dict(os.environ)
+        if threads:
+            env.update({k: str(threads) for k in THREAD_VARS})
+        child = subprocess.Popen(cmd, preexec_fn=preexec, close_fds=True, pass_fds=(slots.fd,), env=env)
     except OSError as e:
         slots.release()
         rec.update(rc=127, error=str(e))
         write_log(rec)
         eprint(f"dingo-pack: cannot start {cmd[0]}: {e}")
         return 127
-    slots.write_holder({"session": who, "op": "run", "cmd": rec["cmd"], "est": est, "pid": os.getpid(),
-                        "job_pid": child.pid, "since": t_start, "limit": limit, "tree_limit": tree})
+    holder = {"session": who, "op": "run", "cmd": rec["cmd"], "est": est, "threads": threads, "pid": os.getpid(),
+              "start": proc_start(os.getpid()), "job_pid": child.pid, "since": t_start, "job_since": t_start,
+              "limit": limit, "tree_limit": tree, "peak": 0}
+    slots.write_holder(holder)
+    peak_written = 0.0
 
     def forward(signum, frame):
         kill_tree(child.pid, signum)
@@ -675,6 +874,13 @@ def cmd_run(args):
             pass
         r = tree_rss(child.pid)
         peak = max(peak, r)
+        if peak > holder["peak"] and now() - peak_written > 2:   # others count us by our peak after a while
+            holder["peak"] = peak
+            peak_written = now()
+            try:
+                slots.write_holder(holder)
+            except OSError:
+                pass
         if tree and r > tree and not stopped:
             stopped, t_term = True, now()
             eprint(f"dingo-pack: process tree uses {fmt_size(r)} > --tree-limit {fmt_size(tree)}; stopping it")
@@ -685,11 +891,15 @@ def cmd_run(args):
     ru = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     ru_bytes = ru if sys.platform == "darwin" else ru * 1024
     slots.release()
+    raw_rc = rc
+    if raw_rc or stopped:
+        eprint(memory_diagnostic(raw_rc, limit, tree, args.limit_kind, stopped, peak))
     if rc < 0:
         rc = 128 - rc
     if stopped:
         rc = EXIT_TREE_LIMIT
-    rec.update(rc=rc, wall_s=round(now() - t_start, 2), peak_tree_rss=peak, peak_proc_rss=ru_bytes,
+    rec.update(rc=rc, child_rc=raw_rc, limit_kind=args.limit_kind,
+               wall_s=round(now() - t_start, 2), peak_tree_rss=peak, peak_proc_rss=ru_bytes,
                stopped_by_tree_limit=stopped)
     write_log(rec)
     if stopped:
@@ -710,7 +920,7 @@ def lease_daemon(slots, rec, until, owner_pid, owner_start):
     def on_term(signum, frame):
         stop["why"] = "released"
     signal.signal(signal.SIGTERM, on_term)
-    rec = dict(rec, pid=os.getpid())
+    rec = dict(rec, pid=os.getpid(), start=proc_start(os.getpid()))
     slots.write_holder(rec)
     while stop["why"] is None:
         if now() >= until:
@@ -727,10 +937,11 @@ def lease_daemon(slots, rec, until, owner_pid, owner_start):
 def cmd_lease(args):
     check_local_state()
     cfg = config()
-    est = args.mem if args.mem is not None else parse_size(cfg.get("default_mem", "2G"))
+    est = args.mem if args.mem is not None else parse_size(cfg.get("default_mem", "1G"))
     reserve = reserve_bytes(cfg)
     check_fits(est, reserve)
-    slots = Slots(args.slots or cfg.get("slots", 6))
+    threads = args.threads if args.threads is not None else DEFAULT_THREADS["lease"]
+    slots = Slots(lane_size("heavy", cfg, args.slots), "heavy", threads)
     who = session_label(args)
     owner_pid, owner_start = owner_process()
     if not owner_pid:
@@ -738,13 +949,15 @@ def cmd_lease(args):
                "only by `release` or --for")
     try:
         slot_wait, mem_wait = slots.acquire(est, reserve, args.timeout,
-                                            {"session": who, "cmd": "lease: " + (args.note or ""), "est": est})
+                                            {"session": who, "cmd": "lease: " + (args.note or ""), "est": est,
+                                             "threads": threads})
     except Deadline:
         write_log({"t": now(), "op": "lease", "session": who, "rc": EXIT_TIMEOUT})
         eprint("dingo-pack: no slot / memory within --timeout")
         return EXIT_TIMEOUT
     t = now()
-    rec = {"session": who, "op": "lease", "cmd": "lease: " + (args.note or ""), "est": est, "since": t,
+    rec = {"session": who, "op": "lease", "cmd": "lease: " + (args.note or ""), "est": est, "threads": threads,
+           "since": t,
            "until": t + args.duration, "owner_pid": owner_pid, "owner_start": owner_start,
            "slot": slots.index}
     write_log(dict(rec, t=t, slot_wait_s=round(slot_wait, 2), mem_wait_s=round(mem_wait, 2)))
@@ -786,6 +999,9 @@ def cmd_release(args):
         elif not (owner_pid and h.get("owner_pid") == owner_pid) and h.get("session") != session_label(args):
             continue
         try:
+            if not pid_alive(h.get("pid"), h.get("start")):
+                eprint(f"dingo-pack: {lid}: that lease's process is gone; nothing to release")
+                continue
             os.kill(int(h["pid"]), signal.SIGTERM)
             n += 1
             print(f"released {lid}")
@@ -796,19 +1012,77 @@ def cmd_release(args):
     return EXIT_OK
 
 
-def cmd_who(args):
+def promised(table=None):
+    """Memory that admitted jobs said they would use and have not used yet."""
+    table = table if table is not None else proc_table()
+    unmet = 0
+    for i, h in holders():
+        if h.get("op") == "waiting for memory":
+            continue
+        jp = h.get("job_pid")
+        used = tree_rss(jp, table) if jp else 0
+        unmet += max(0, commitment(h) - used)
+    return unmet
+
+
+def ghost_summary():
+    """Cached by `save` (a /proc scan is too slow for every hook call)."""
+    return read_json(os.path.join(state_dir(), "ghosts.json"), {}) or {}
+
+
+def status_info(args=None):
     cfg = config()
-    n = int(args.slots or cfg.get("slots", 6))
     total, avail = meminfo()
     table = proc_table()
+    hs = holders()
+    reserve = reserve_bytes(cfg)
+    prom = promised(table)
+    dm = parse_size(cfg.get("default_mem", "1G"))
+    lanes = {}
+    for ln in LANE_DIRS:
+        n = lane_size(ln, cfg, getattr(args, "slots", None) if ln == "heavy" else None)
+        lanes[ln] = {"held": sum(1 for _, h in hs if h["lane"] == ln), "n": n}
+    free_slots = max(0, lanes["heavy"]["n"] - lanes["heavy"]["held"])
+    room = (avail - reserve - prom) if avail is not None else None
+    k = free_slots if room is None else max(0, min(free_slots, int(room // dm) if dm else free_slots))
+    ct, cu = cpu_total(cfg), cpu_used()
+    k = max(0, min(k, (ct - cu) // DEFAULT_THREADS["heavy"]))
+    la, nc = loadavg(), n_cpus()
+    waiting = []
+    for p in glob.glob(os.path.join(sub_dir("waiting"), "*.json")):
+        w = read_json(p, {}) or {}
+        if pid_alive(w.get("pid")):
+            waiting.append(w)
+    rows = []
+    for i, h in hs:
+        pid = h.get("job_pid") or h.get("pid")
+        rows.append(dict(h, slot=i, now=tree_rss(pid, table) if pid else None))
+    return {"lanes": lanes, "cpu": {"used": cu, "total": ct}, "load": la, "ncpu": nc,
+            "overloaded": bool(la is not None and la > 1.5 * nc),
+            "total": total, "avail": avail, "reserve": reserve, "promised": prom,
+            "default_mem": dm, "suggest_parallel": k, "holders": rows, "waiting": waiting,
+            "ghosts": ghost_summary()}
+
+
+def cmd_who(args):
+    info = status_info(args)
+    if getattr(args, "json", False):
+        print(json.dumps(info, ensure_ascii=False, default=str))
+        return EXIT_OK
+    cfg = config()
+    total, avail = info["total"], info["avail"]
+    table = proc_table()
     held = holders()
-    print(f"slots: {len(held)} / {n} held · memory available {fmt_size(avail)} of {fmt_size(total)} "
-          f"· reserve {fmt_size(reserve_bytes(cfg))}")
+    L = info["lanes"]
+    print(f"slots: {L['heavy']['held']} / {L['heavy']['n']} heavy, {L['io']['held']} / {L['io']['n']} io, "
+          f"CPU {info['cpu']['used']} / {info['cpu']['total']} "
+          f"· memory available {fmt_size(avail)} of {fmt_size(total)} "
+          f"· promised {fmt_size(info['promised'])} · reserve {fmt_size(reserve_bytes(cfg))}")
     for i, h in held:
         pid = h.get("job_pid") or h.get("pid")
         rss = tree_rss(pid, table) if pid else None
         extra = f" until {hhmm(h['until'])}" if h.get("until") else ""
-        print(f"  [{i}] {h.get('session', '?'):<18} {h.get('op', '?'):<5} {int(now() - h.get('since', now()))} s"
+        print(f"  [{h['lane']}:{i}] {h.get('session', '?'):<18} {h.get('op', '?'):<5} {int(now() - h.get('since', now()))} s"
               f"  est {fmt_size(h.get('est'))} now {fmt_size(rss)}{extra}  {h.get('cmd', '')}")
     waiting = []
     for p in glob.glob(os.path.join(sub_dir("waiting"), "*.json")):
@@ -905,9 +1179,13 @@ def status_line(cwd, name, pcfg, listing=None):
         return path, None
     r = re.compile(rx)
     last = None
-    for line in tail.splitlines():
+    lines = tail.splitlines()
+    for k, line in enumerate(lines):
         if r.search(line):
             last = line.strip()
+            if last.startswith("#"):                       # "## 状态行（…）" with the text below it
+                nxt = next((x.strip() for x in lines[k + 1:k + 4] if x.strip()), "")
+                last = (last.lstrip("# ") + " " + nxt).strip()
     return path, last
 
 
@@ -982,6 +1260,8 @@ def build_roster(old):
         alive = e.get("_alive")
         s.update(sid=sid, name=name, cwd=cwd, transcript=tr, pid=e.get("pid"),
                  cc_status=e.get("status"), registry_recognised=not fallback)
+        if e.get("startedAt"):
+            s["started_at"] = e["startedAt"] / 1000.0
         if tr:
             try:
                 s["last_activity"] = os.path.getmtime(tr)
@@ -1078,6 +1358,15 @@ def save_roster(quiet=False, min_gap=0.0):
     finally:
         os.close(lk)
     r = add_status_lines(r) or r
+    st, gs = run_timed(lambda: scan_ghosts(r), 5)
+    if st == "ok":
+        loose = [g for g in gs if not g["kept"]]
+        try:
+            write_atomic(os.path.join(state_dir(), "ghosts.json"), json.dumps(
+                {"t": now(), "n": len(loose), "pss": sum(g["pss"] for g in loose),
+                 "kept": len(gs) - len(loose)}))
+        except OSError:
+            pass
     if not quiet:
         alive = sum(1 for s in r["sessions"].values() if s.get("alive"))
         print(f"roster saved: {alive} alive, {len(r['sessions'])} known -> {os.path.join(rd, 'roster.md')}")
@@ -1117,6 +1406,8 @@ def add_status_lines(r):
             for sid, (lp, line) in found.items():
                 s = cur["sessions"].get(sid)
                 if s is not None and (s.get("log"), s.get("status_line")) != (lp, line):
+                    if line != s.get("status_line"):
+                        s["status_changed_at"] = now()
                     s["log"], s["status_line"] = lp, line
                     changed = True
             if changed:
@@ -1197,7 +1488,7 @@ def cmd_mark(args):
     return EXIT_OK
 
 
-GROUPS = [("midway", "🔴 midway - resume now"), ("waiting", "⏰ waiting for a time - resume when due"),
+GROUPS = [("stowed", "📦 stowed - bring back with: dingo-pack unstow"), ("midway", "🔴 midway - resume now"), ("waiting", "⏰ waiting for a time - resume when due"),
           ("blocked", "⛔ blocked on a person"), ("idle", "💤 idle (no self-report) - check before resuming"),
           ("unknown", "❔ unknown"), ("done", "✅ done - no need to resume")]
 
@@ -1239,7 +1530,9 @@ def cmd_list(args):
         pick = [p for p in snaps if os.path.basename(p)[:15].replace("-", "") <= args.at.replace("-", "").replace(":", "")]
         if pick:
             r = read_json(pick[-1], r)
-    rows = select(r, args.since, args.closed)
+    stowed = set(stowed_sessions(r))
+    rows = [s for s in select(r, args.since, True)
+            if args.closed or s.get("ended") != "closed" or s["sid"] in stowed]
     alive_now = [s for s in r["sessions"].values() if s.get("alive")]
     if args.json:
         print(json.dumps({"lost": rows, "alive": alive_now}, ensure_ascii=False, indent=1))
@@ -1249,7 +1542,7 @@ def cmd_list(args):
     if not r.get("registry_recognised", True):
         print("  ⚠ Claude Code session registry not recognised; names / cwd may be missing")
     for key, title in GROUPS:
-        grp = [s for s in rows if state_of(s)[0] == key]
+        grp = [s for s in rows if ("stowed" if s["sid"] in stowed else state_of(s)[0]) == key]
         if not grp:
             continue
         print(f"\n{title}")
@@ -1328,6 +1621,11 @@ def cmd_resume(args):
     else:
         eprint("dingo-pack resume: name sessions, or say --midway / --lost")
         return EXIT_USAGE
+    return reopen(rows, args, prompt_key="resume_prompt", default_prompt=DEFAULT_PROMPT)
+
+
+def reopen(rows, args, prompt_key, default_prompt):
+    """Open each session in `rows` with `claude --resume`, in batches. Skips live ones."""
     reg, _ = read_registry()
     todo = []
     for s in sorted(rows, key=lambda s: -(s.get("last_activity") or 0)):
@@ -1356,7 +1654,7 @@ def cmd_resume(args):
             else:
                 print(f"stopped after a batch of {batch}; still to resume: {rest}")
                 return EXIT_OK
-        prompt = args.prompt or project_config(s.get("cwd") or ".").get("resume_prompt") or DEFAULT_PROMPT
+        prompt = args.prompt or project_config(s.get("cwd") or ".").get(prompt_key) or default_prompt
         path = launcher(s, prompt)
         print(f"  {s.get('name')}: {s['sid']} in {s.get('cwd')}")
         rc = open_tab(via, s, path)
@@ -1368,7 +1666,2478 @@ def cmd_resume(args):
     return EXIT_OK
 
 
+# ---------------------------------------------------------------- ghosts (scan)
+
+def proc_environ(pid, keys=(b"CLAUDE_PID", b"CLAUDE_CODE_SESSION_ID", b"DINGO_SCOPE_TAG")):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return {}
+    out = {}
+    for item in raw.split(b"\0"):
+        k, sep, v = item.partition(b"=")
+        if sep and k in keys:
+            out[k.decode()] = v.decode("utf-8", "replace")
+    return out
+
+
+def proc_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+
+def proc_detached(pid):
+    """True if the process looks deliberately left running: SIGHUP ignored (nohup), its own
+    session leader (setsid / daemon), or a terminal multiplexer."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("SigIgn:") and int(line.split()[1], 16) & 1:
+                    return True
+        with open(f"/proc/{pid}/stat") as f:
+            st = f.read()
+        comm = st[st.index("(") + 1:st.rindex(")")]
+        fields = st[st.rindex(")") + 2:].split()
+        if int(fields[3]) == int(pid):                 # session id == pid
+            return True
+        if comm.startswith(("tmux", "screen")):
+            return True
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
+def scan_ghosts(roster=None):
+    """Process trees whose Claude Code session is gone. Returns a list of groups:
+    {owner_pid, sid, name, pids, pss, cmd, age_s, kept, why_kept}."""
+    if not os.path.isdir("/proc/self"):
+        return []
+    table = proc_table()
+    reg = {}
+    for p in glob.glob(os.path.join(claude_home(), "sessions", "*.json")):
+        e = read_json(p)
+        if isinstance(e, dict) and "pid" in e:
+            reg[int(e["pid"])] = e
+    live_claude = {pid for pid, e in reg.items() if pid_alive(pid, e.get("procStart"))}
+    present = [pid for pid in reg if pid in table]
+    if present and not live_claude:
+        # every registry pid that exists fails the start-time check: the format probably changed.
+        # Fall back to "the pid exists" rather than calling every session's children ghosts.
+        live_claude = set(present)
+        reg = {pid: dict(e, procStart=None) for pid, e in reg.items()}
+    protected = set()
+    for c in live_claude:
+        protected.update(tree_pids(c, table))
+    roster = roster or load_roster()
+    by_pid = {}
+    for s in (roster.get("sessions") or {}).values():
+        if s.get("pid"):
+            by_pid[int(s["pid"])] = s
+    me = os.getpid()
+    # Narrowing only: with DINGO_SCOPE_TAG set, look at nothing but processes that carry the same
+    # tag in their environment (the self-test uses this so it never touches real processes).
+    scope = os.environ.get("DINGO_SCOPE_TAG")
+    p = me
+    while p and p in table and p not in protected:      # our own ancestors are never ghosts
+        protected.add(p)
+        p = table[p][0]
+    ghosts = {}
+    for pid in table:
+        if pid in protected or pid == me:
+            continue
+        env = proc_environ(pid)
+        if scope and env.get("DINGO_SCOPE_TAG") != scope:
+            continue                        # scoped scan (self-test): only processes carrying the tag
+        cp = env.get("CLAUDE_PID")
+        if not cp or not cp.isdigit():
+            continue
+        cp = int(cp)
+        if pid == cp:
+            continue
+        e = reg.get(cp)
+        if e is not None:
+            owner_ok = pid_alive(cp, e.get("procStart"))
+        else:                                          # registry file gone or kept elsewhere:
+            owner_ok = cp in table                     # can't verify, so never call it a ghost
+        if owner_ok:
+            continue                                   # its session is still there
+        ghosts.setdefault(cp, set()).add(pid)
+    out = []
+    bt = boot_time() or 0
+    tick = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    kids = {}
+    for pid, (pp, _) in table.items():
+        kids.setdefault(pp, []).append(pid)
+    split = {}
+    for cp, pids in ghosts.items():
+        roots = [p for p in pids if table.get(p, (0, 0))[0] not in pids]
+        for root in roots:
+            tree, stack = set(), [root]
+            while stack:
+                q = stack.pop()
+                if q in pids and q not in tree:
+                    tree.add(q)
+                    stack.extend(kids.get(q, []))
+            key = (cp, proc_detached(root))
+            split.setdefault(key, set()).update(tree)
+    for (cp, _detached), pids in split.items():
+        roots = [p for p in pids if table.get(p, (0, 0))[0] not in pids]
+        s = by_pid.get(cp) or {}
+        e = reg.get(cp) or {}
+        sid = e.get("sessionId") or s.get("sid") or ""
+        name = (e.get("name") if e.get("nameSource") == "user" else None) or s.get("name") or (sid[:8] or f"pid {cp}")
+        why = []
+        if any(proc_detached(p) for p in roots):
+            why.append("detached (nohup / setsid / tmux)")
+        mk = (s.get("mark") or {}).get("state")
+        if mk == "waiting":
+            why.append("its session said it is waiting")
+        starts = [proc_start(p) for p in roots]
+        age = max((now() - (bt + st / tick)) for st in starts if st) if any(starts) and bt else None
+        total = 0
+        for p in pids:
+            v = proc_pss(p)
+            total += v if v is not None else table.get(p, (0, 0))[1]
+        out.append({"owner_pid": cp, "sid": sid, "name": name, "pids": sorted(pids), "roots": sorted(roots),
+                    "starts": {str(p): proc_start(p) for p in pids},
+                    "pss": total, "cmd": proc_cmdline(min(roots))[:100] if roots else "",
+                    "age_s": age, "kept": bool(why), "why_kept": why})
+    out.sort(key=lambda g: -g["pss"])
+    return out
+
+
+def cmd_ghosts(args):
+    groups = scan_ghosts()
+    if args.json and not args.reap:
+        print(json.dumps(groups, ensure_ascii=False, indent=1))
+        return EXIT_OK
+    if not groups:
+        print("no ghosts: every process started by a Claude Code session belongs to a live one")
+        return EXIT_OK
+    total = sum(g["pss"] for g in groups)
+    print(f"{len(groups)} ghost tree(s), {fmt_size(total)} in all")
+    for k, g in enumerate(groups, 1):
+        age = fmt_duration(g["age_s"]) if g.get("age_s") else "?"
+        tag = f"  [kept: {', '.join(g['why_kept'])}]" if g["kept"] else ""
+        print(f"  #{k} {g['name']:<24} {len(g['pids'])} proc  {fmt_size(g['pss']):>6}  up {age:<8} {g['cmd']}{tag}")
+    if not args.reap:
+        print("reap with: dingo-pack ghosts --reap [#...]   (human only)")
+        return EXIT_OK
+    return reap(groups, args)
+
+
+def reap(groups, args):
+    if is_agent():
+        eprint("dingo-pack ghosts --reap is for humans: refused inside an agent session.")
+        return EXIT_USAGE
+    pick = set(args.ids or [])
+    todo = []
+    for k, g in enumerate(groups, 1):
+        named = f"#{k}" in pick or str(k) in pick
+        if pick and not named:
+            continue
+        if g["kept"] and not named:
+            print(f"  skip #{k} {g['name']}: {', '.join(g['why_kept'])} (name it to reap)")
+            continue
+        todo.append((k, g))
+    for k, g in todo:
+        if not args.yes:
+            if not sys.stdin.isatty():
+                print(f"  skip #{k}: not confirmed (use --yes)")
+                continue
+            if input(f"  reap #{k} {g['name']} ({len(g['pids'])} processes, {fmt_size(g['pss'])})? [y/N] ").strip().lower() != "y":
+                continue
+        # check again right before acting; one dead session can have two groups (kept / not)
+        fresh = {(x["owner_pid"], tuple(x["roots"])): x for x in scan_ghosts()}
+        g2 = fresh.get((g["owner_pid"], tuple(g["roots"])))
+        if not g2:
+            print(f"  #{k}: no longer a ghost; left alone")
+            continue
+        victims = [p for p in g["pids"] if p in g2["pids"] and g["starts"].get(str(p)) == g2["starts"].get(str(p))]
+        starts = g2["starts"]
+        for p in victims:
+            try:
+                os.kill(p, signal.SIGTERM)
+            except OSError:
+                pass
+        deadline = now() + float(os.environ.get("DINGO_KILL_GRACE", "10"))
+        while now() < deadline and any(pid_alive(p, starts.get(str(p))) for p in victims):
+            time.sleep(0.2)
+        for p in victims:
+            killed = "term"
+            if pid_alive(p, starts.get(str(p))):
+                try:
+                    os.kill(p, signal.SIGKILL)
+                    killed = "kill"
+                except OSError:
+                    pass
+            write_log({"t": now(), "op": "reap", "pid": p, "how": killed, "session": g["name"], "sid": g["sid"],
+                       "owner_pid": g["owner_pid"], "why": "CLAUDE_PID owner gone, outside every live session",
+                       "cmd": proc_cmdline(p)[:120]})
+        print(f"  reaped #{k} {g['name']}: {len(victims)} process(es)")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------- doctor
+
+def find_cmd(name):
+    """shutil.which without the Windows directories WSL appends to PATH (each lookup there
+    costs a 9p round trip, and hangs if the C: drive is gone)."""
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d or d.startswith("/mnt/"):
+            continue
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def run_timed(fn, timeout):
+    """Run fn() in a daemon thread; ('ok', value) | ('error', exc) | ('timeout', None).
+    A call stuck on a dead network mount cannot be interrupted; we just stop waiting."""
+    import threading
+    box = {}
+
+    def go():
+        try:
+            box["v"] = ("ok", fn())
+        except Exception as e:      # noqa: BLE001
+            box["v"] = ("error", e)
+    th = threading.Thread(target=go, daemon=True)
+    th.start()
+    th.join(timeout)
+    return box.get("v", ("timeout", None))
+
+
+DMESG_RE = re.compile(r"^\[(\w{3} \w{3}\s+\d+ \d\d:\d\d:\d\d \d{4})\]\s*(.*)$")
+OOM_RE = re.compile(r"(?i)out of memory|oom-kill|oom_reaper|page allocation failure|9pnet.*(error|fail)")
+NET_FS = ("9p", "drvfs", "nfs", "nfs4", "cifs", "smb3", "smbfs", "fuse.sshfs", "v9fs", "virtiofs")
+
+
+def dmesg_lines():
+    fake = os.environ.get("DINGO_FAKE_DMESG")
+    if fake:
+        with open(fake, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+    r = subprocess.run(["dmesg", "-T"], capture_output=True, text=True, timeout=5)
+    if r.returncode:
+        raise OSError(r.stderr.strip() or f"dmesg exit {r.returncode}")
+    return r.stdout.splitlines()
+
+
+def probe_mount(path):
+    if os.path.isdir(path):
+        os.listdir(path)
+    else:                         # (self-test only) a FIFO stands in for a hung mount
+        with open(path) as f:
+            f.read(1)
+    return True
+
+
+def mounts():
+    path = os.environ.get("DINGO_FAKE_MOUNTS", "/proc/mounts")
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 3 and p[2] in NET_FS:
+                    out.append((p[1].replace("\\040", " "), p[2]))
+    except OSError:
+        pass
+    return out
+
+
+def find_wslconfig():
+    fake = os.environ.get("DINGO_FAKE_WSLCONFIG")
+    if fake is not None:
+        return [fake] if fake and os.path.exists(fake) else []
+    return glob.glob("/mnt/c/Users/*/.wslconfig")
+
+
+def is_wsl():
+    if os.environ.get("DINGO_FAKE_WSL") is not None:
+        return os.environ["DINGO_FAKE_WSL"] == "1"
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+def doctor_checks(args):
+    """Yields (level, name, message, hint). level: ok | warn | bad | info."""
+    cfg = config()
+    total, avail = meminfo()
+    reserve = reserve_bytes(cfg)
+    if avail is None:
+        yield ("info", "memory", "free memory unknown on this platform", "")
+    else:
+        lvl = "bad" if avail < reserve else "warn" if avail < 2 * reserve else "ok"
+        yield (lvl, "memory", f"{fmt_size(avail)} free of {fmt_size(total)} (reserve {fmt_size(reserve)})",
+               "close idle sessions or reap ghosts" if lvl != "ok" else "")
+    la, nc = loadavg(), n_cpus()
+    if la is not None:
+        r_ = la / nc
+        lvl = "bad" if r_ > 3 else "warn" if r_ > 1.5 else "ok"
+        yield (lvl, "cpu", f"load {la:.1f} on {nc} cores ({r_:.1f} per core)",
+               "too many threads at once: run heavy jobs with `dingo-pack run --heavy --threads N`, "
+               "set OMP_NUM_THREADS etc." if lvl != "ok" else "")
+    # OOM / 9p errors in the kernel log
+    st, val = run_timed(dmesg_lines, 6)
+    if st != "ok":
+        yield ("info", "kernel log", f"cannot read dmesg ({val if st == 'error' else 'timed out'})",
+               "run `sudo dmesg -T | grep -i oom` yourself")
+    else:
+        hits = []
+        for line in val:
+            m = DMESG_RE.match(line)
+            text = m.group(2) if m else line
+            if OOM_RE.search(text):
+                t = None
+                if m:
+                    try:
+                        t = time.mktime(time.strptime(re.sub(r"\s+", " ", m.group(1)), "%a %b %d %H:%M:%S %Y"))
+                    except ValueError:
+                        t = None
+                hits.append((t, text.strip()))
+        recent = [h for h in hits if h[0] is None or now() - h[0] < 86400]
+        if recent:
+            last = recent[-3:]
+            yield ("warn", "kernel log", f"{len(recent)} OOM / page-allocation / 9p line(s) in the last 24 h; latest: "
+                   + " | ".join(f"{hhmm(t)} {x[:70]}" for t, x in last),
+                   "see the WSL notes in REFERENCE.md")
+        else:
+            yield ("ok", "kernel log", "no OOM kills in the last 24 h", "")
+    # network / 9p mounts answer?
+    ms = mounts()
+    if not ms:
+        yield ("ok", "mounts", "no network / 9p mounts", "")
+    for mp, fstype in ms:
+        st, val = run_timed(lambda mp=mp: probe_mount(mp), float(os.environ.get("DINGO_PROBE_TIMEOUT_S", "3")))
+        if st == "ok":
+            yield ("ok", "mounts", f"{mp} ({fstype}) answers", "")
+        elif st == "timeout":
+            yield ("bad", "mounts", f"{mp} ({fstype}) does not answer within 3 s",
+                   "probably dropped; remount it (WSL: `wsl.exe -u root mount -t drvfs ...`)")
+        else:
+            yield ("bad", "mounts", f"{mp} ({fstype}): {val}", "remount it")
+    # WSL settings
+    if is_wsl():
+        st, files = run_timed(find_wslconfig, 3)
+        if st != "ok":
+            yield ("warn", "wsl", "cannot look for .wslconfig (C: drive not answering?)", "")
+        elif not files:
+            yield ("warn", "wsl", "no .wslconfig: WSL uses its default memory and swap",
+                   "set [wsl2] memory= and swap= (see REFERENCE.md), then `wsl --shutdown`")
+        else:
+            txt = ""
+            st2, txt = run_timed(lambda: open(files[0], encoding="utf-8", errors="replace").read(), 3)
+            txt = txt if st2 == "ok" else ""
+            got = {k: v for k, v in re.findall(r"(?im)^\s*(memory|swap)\s*=\s*(\S+)", txt or "")}
+            if "memory" in {k.lower() for k in got}:
+                yield ("ok", "wsl", f".wslconfig sets {', '.join(f'{k}={v}' for k, v in got.items())}", "")
+            else:
+                yield ("warn", "wsl", ".wslconfig has no memory= line", "add [wsl2] memory= and swap=")
+        mf = os.environ.get("DINGO_FAKE_MINFREE")
+        try:
+            mfk = int(mf) if mf else int(open("/proc/sys/vm/min_free_kbytes").read())
+            yield ("ok" if mfk >= 131072 else "warn", "wsl", f"vm.min_free_kbytes = {mfk}",
+                   "" if mfk >= 131072 else "raise to 262144 (keeps memory free for 9p)")
+        except (OSError, ValueError):
+            pass
+    # slots held by orphans
+    orphans = []
+    for i, h in holders():
+        pid, jp = h.get("pid"), h.get("job_pid")
+        if not pid_alive(pid) and not (jp and pid_alive(jp)):
+            orphans.append(f"[{i}] {h.get('session', '?')} {h.get('cmd', '')[:40]}")
+    if orphans:
+        yield ("warn", "slots", "held although the job is gone: " + "; ".join(orphans),
+               "a leftover child still has the slot open; find it with `lsof <state>/slots/slot-N`")
+    else:
+        yield ("ok", "slots", f"{len(holders())} held, none orphaned", "")
+    # roster: lost sessions nobody brought back
+    r = load_roster()
+    lost = [s for s in select(r, 24.0, False) if state_of(s)[0] not in ("done",)]
+    if lost:
+        yield ("warn", "roster", f"{len(lost)} session(s) gone and not resumed: "
+               + ", ".join(s.get("name", "?") for s in lost[:8]), "dingo-pack list / resume")
+    else:
+        yield ("ok", "roster", "no lost sessions in the last 24 h", "")
+    # ghosts
+    st, gs = run_timed(lambda: scan_ghosts(r), 10)
+    if st != "ok":
+        yield ("info", "ghosts", "process scan did not finish in 10 s (a process stuck on a dead mount?)", "")
+        gs = None
+    if gs is not None:
+        loose = [g for g in gs if not g["kept"]]
+        kept = [g for g in gs if g["kept"]]
+        gb = sum(g["pss"] for g in loose)
+        if loose:
+            yield ("bad" if gb > GIB else "warn", "ghosts", f"{len(loose)} tree(s) whose session is gone, {fmt_size(gb)}",
+                   "dingo-pack ghosts (and --reap, human only)")
+        else:
+            yield ("ok", "ghosts", "none", "")
+        if kept:
+            yield ("info", "ghosts", f"{len(kept)} kept on purpose (nohup / setsid / tmux / waiting), "
+                   f"{fmt_size(sum(g['pss'] for g in kept))}", "")
+    # git locks, through wombat-gate if it is installed
+    wg = None
+    if args.git:
+        st_w, wg = run_timed(lambda: find_cmd("wombat-gate"), 3)
+        wg = wg if st_w == "ok" else None
+    repos = sorted({s.get("cwd") for s in r.get("sessions", {}).values() if s.get("alive") and s.get("cwd")})
+    if args.git and wg:
+        for cwd in repos:
+            st, res = run_timed(lambda cwd=cwd: subprocess.run(
+                [wg, "doctor", "--json"], cwd=cwd, capture_output=True, text=True, timeout=20), 25)
+            if st != "ok" or res.returncode not in (0, 1):
+                yield ("info", "git locks", f"{cwd}: wombat-gate doctor not available", "")
+                continue
+            try:
+                for item in json.loads(res.stdout).get("checks", []):
+                    yield (item.get("level", "info"), "git locks", f"{cwd}: {item.get('message', '')}",
+                           item.get("hint", ""))
+            except ValueError:
+                yield ("info", "git locks", f"{cwd}: unreadable wombat-gate doctor output", "")
+
+
+ICON = {"ok": "✅", "warn": "⚠️ ", "bad": "⛔", "info": "ℹ️ "}
+
+
+def cmd_doctor(args):
+    rows = list(doctor_checks(args))
+    if args.json:
+        print(json.dumps({"checks": [{"level": l, "name": n, "message": m, "hint": h} for l, n, m, h in rows]},
+                         ensure_ascii=False, indent=1))
+    else:
+        for l, n, m, h in rows:
+            print(f"{ICON[l]} {n:<10} {m}" + (f"\n             → {h}" if h else ""))
+    bad = any(l == "bad" for l, *_ in rows)
+    sys.stdout.flush()
+    os._exit(1 if bad else 0)          # a probe thread may still be stuck on a dead mount
+
+
+# ---------------------------------------------------------------- stow / unstow
+
+DEFAULT_UNSTOW_PROMPT = ("You were put away for a planned pause and are back now. Re-read the end of your log "
+                         "and your last status line, then carry on where you stopped.")
+
+
+def stows_dir():
+    return sub_dir("stows")
+
+
+def latest_stow():
+    files = sorted(glob.glob(os.path.join(stows_dir(), "*.json")))
+    return (read_json(files[-1]) or {}) if files else {}
+
+
+def stowed_sessions(roster=None, days=7):
+    """Sessions some stow closed and that have not been seen alive since: {sid: record}."""
+    roster = roster or load_roster()
+    cut = now() - days * 86400
+    out = {}
+    for f in sorted(glob.glob(os.path.join(stows_dir(), "*.json"))):
+        rec = read_json(f) or {}
+        if (rec.get("t") or 0) < cut:
+            continue
+        for x in rec.get("sessions", []):
+            if x.get("closed"):
+                out[x["sid"]] = x
+    for sid in list(out):
+        s = roster.get("sessions", {}).get(sid) or {}
+        closed_at = out[sid].get("closed_at") or 0
+        if s.get("alive") or (s.get("last_seen") or 0) > closed_at + 30:
+            del out[sid]                         # it came back after that stow
+    return out
+
+
+def cmd_stow(args):
+    r = save_roster(quiet=True) or load_roster()
+    me = my_session_id(args)
+    reg, _ = read_registry()
+    alive = [s for s in r["sessions"].values() if s.get("alive")]
+    rec = {"t": now(), "host": socket.gethostname(), "sessions": []}
+    plan = []
+    for s in sorted(alive, key=lambda s: s.get("name") or ""):
+        st, _guessed = state_of(s)
+        mk = s.get("mark") or {}
+        if mk.get("t") and (s.get("last_activity") or 0) > mk["t"] + 120 and st in ("waiting", "done"):
+            st = "stale mark"              # it kept working after saying waiting / done
+        e = reg.get(s["sid"]) or {}
+        closable = (e.get("status") == "idle" and st in ("waiting", "done") and s["sid"] != me
+                    and e.get("_alive"))
+        rec["sessions"].append({"sid": s["sid"], "name": s.get("name"), "cwd": s.get("cwd"), "state": st,
+                                "cc_status": s.get("cc_status"), "mark": s.get("mark"),
+                                "status_line": s.get("status_line"), "transcript": s.get("transcript"),
+                                "closed": False})
+        plan.append((s, e, closable))
+    if args.close and not args.dry_run and is_agent():
+        eprint("dingo-pack stow --close closes other sessions: run it yourself, not from inside an agent.")
+        return EXIT_USAGE
+    print(f"stowing {len(alive)} live session(s){' (dry run)' if args.dry_run else ''}:")
+    for idx, (s, e, closable) in enumerate(plan):
+        st = rec["sessions"][idx]["state"]
+        action = "keep running"
+        if args.close and closable:
+            action = "close"
+            if not args.dry_run:
+                pid = e.get("pid")
+                fresh = read_json(os.path.join(claude_home(), "sessions", f"{pid}.json"), {}) or {}
+                try:
+                    if fresh.get("sessionId") != s["sid"] or fresh.get("status") != "idle":
+                        action = f"keep running (now {fresh.get('status') or 'gone'})"
+                    elif pid_alive(pid, e.get("procStart")):
+                        os.kill(int(pid), signal.SIGTERM)
+                        deadline = now() + float(os.environ.get("DINGO_STOW_WAIT_S", "10"))
+                        while now() < deadline and pid_alive(pid, e.get("procStart")):
+                            time.sleep(0.2)
+                        if pid_alive(pid, e.get("procStart")):
+                            action = "asked to close, still running"
+                        else:
+                            action = "closed"
+                            rec["sessions"][idx]["closed"] = True
+                            rec["sessions"][idx]["closed_at"] = now()
+                except OSError as ex:
+                    action = f"could not close ({ex})"
+                write_log({"t": now(), "op": "stow-close", "session": s.get("name"), "sid": s["sid"],
+                           "pid": pid, "result": action})
+        elif args.close:
+            why = "this session" if s["sid"] == me else \
+                "busy" if s.get("cc_status") != "idle" else f"state {st}"
+            action = f"keep running ({why})"
+        print(f"  {s.get('name', '?'):<24} {st:<8} {s.get('cc_status') or '?':<7} {action}")
+    if not args.dry_run:
+        name = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}.json"
+        write_atomic(os.path.join(stows_dir(), name), json.dumps(rec, ensure_ascii=False, indent=1))
+        print(f"stow list saved ({name}); bring them back with: dingo-pack unstow")
+    return EXIT_OK
+
+
+def cmd_close_all(args):
+    """Front door: remember every session and close the ones it is safe to close."""
+    args.close = True
+    return cmd_stow(args)
+
+
+def cmd_restore(args):
+    """Front door: bring back the last batch -- what close-all closed, or, if nothing was
+    closed that way, the sessions lost when the machine went down."""
+    r = save_roster(quiet=True) or load_roster()
+    if stowed_sessions(r) or args.names:
+        return cmd_unstow(args)
+    lost = [s for s in select(r, 24.0, False) if state_of(s)[0] != "done"]
+    if not lost:
+        print("nothing to restore: no closed or lost sessions in the last 24 h")
+        return EXIT_OK
+    print(f"nothing closed by close-all; restoring {len(lost)} session(s) lost when the machine went down")
+    return reopen(lost, args, prompt_key="resume_prompt", default_prompt=DEFAULT_PROMPT)
+
+
+def cmd_unstow(args):
+    r = save_roster(quiet=True) or load_roster()
+    pool = dict(stowed_sessions(r))
+    if args.all or args.names:
+        for x in latest_stow().get("sessions", []):
+            pool.setdefault(x["sid"], x)
+    if not pool:
+        print("nothing stowed")
+        return EXIT_OK
+    rows = []
+    want = set(args.names or [])
+    for x in pool.values():
+        if want and x.get("name") not in want and x["sid"] not in want and x["sid"][:8] not in want:
+            continue
+        s = dict(r["sessions"].get(x["sid"]) or {}, **{k: v for k, v in x.items() if v is not None})
+        s["sid"] = x["sid"]
+        rows.append(s)
+    if not rows:
+        print("nothing to bring back (use --all to include sessions stow left running)")
+        return EXIT_OK
+    return reopen(rows, args, prompt_key="unstow_prompt", default_prompt=DEFAULT_UNSTOW_PROMPT)
+
+
+# ---------------------------------------------------------------- board (0.3, minimal)
+
+BOX_RE = re.compile(r"(?i)\bbox\s?(\d+)\b")
+STAMP_RE = re.compile(r"状态[^\d]{0,20}(?:(\d{1,2})-(\d{1,2})\s*)?[^\d]{0,6}(\d{1,2}):(\d{2}|\dx)")  # when it was written
+DATED_T = re.compile(r"(\d{1,2})-(\d{1,2})\s*(?:约\s*)?(\d{1,2}):(\d{2}|\dx)")
+# An expected finish needs a word that says so: "预计 / 约 … 完 / ETA / 跑完" and a time
+# within a short window after it; inside that window a Berlin time ("＝柏林 HH:MM") wins.
+ETA_KEY = re.compile(r"(?i)预计|约(?=[^，。;；]{0,20}完)|\bETA\b|跑完|完成于")
+ETA_BEFORE = re.compile(r"(\d{1,2}):(\d{2}|\dx)\s*前")
+BERLIN_T = re.compile(r"[＝=]\s*柏林\s*(\d{1,2}):(\d{2}|\dx)")
+ANY_T = re.compile(r"(\d{1,2}):(\d{2}|\dx)")
+
+
+def _on(mon, day, hh, mm, ref):
+    """MM-DD HH:MM in ref's year (local time), or None."""
+    try:
+        mon, day, hh = int(mon), int(day), int(hh)
+        mm = int(mm[0]) * 10 if str(mm).endswith("x") else int(mm)
+        if not (1 <= mon <= 12 and 1 <= day <= 31 and hh <= 23 and mm <= 59):
+            return None
+        return time.mktime((time.localtime(ref).tm_year, mon, day, hh, mm, 0, 0, 0, -1))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _at(hh, mm, ref):
+    """Today's HH:MM (local time) relative to ref; None if not a valid time."""
+    hh = int(hh)
+    mm = int(mm[0]) * 10 if str(mm).endswith("x") else int(mm)        # "19:3x" = about 19:30
+    if hh > 23 or mm > 59:
+        return None
+    lt = time.localtime(ref)
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hh, mm, 0, 0, 0, -1))
+
+
+def parse_status(line, written):
+    """(box, eta, written_at) from a status line. Only the listed forms count; otherwise None."""
+    line = line or ""
+    m = BOX_RE.search(line)
+    box = f"box{m.group(1)}" if m else None
+    w = written
+    st = _stamp(line)
+    if st:
+        if st.group(1):                                     # "10-05 22:0x": the date says which day
+            t = _on(st.group(1), st.group(2), st.group(3), st.group(4), written)
+            if t is not None:
+                w = t
+        else:
+            t = _at(st.group(3), st.group(4), written)
+            if t is not None:
+                w = t - 86400 if t > written + 600 else t   # a stamp later than we saw it: yesterday
+    eta = None
+    hit = None
+    dated = None
+    for k in ETA_KEY.finditer(line):
+        win = line[k.end():k.end() + 40]
+        dated = DATED_T.search(win)
+        hit = dated or BERLIN_T.search(win) or ANY_T.search(win)
+        if hit:
+            break
+    if not hit:
+        hit = ETA_BEFORE.search(line)
+    if hit is not None and hit is dated:
+        eta = _on(dated.group(1), dated.group(2), dated.group(3), dated.group(4), w)
+    elif hit:
+        eta = _at(hit.group(1), hit.group(2), w)
+        if eta is not None and eta < w:
+            eta += 86400                                   # earlier than when it was written: tomorrow
+    return box, eta, w
+
+
+def _stamp(line):
+    """The status line's own time: its '＝柏林 HH:MM' if it gives one, never a 'box HH:MM' (Berlin + 6 h)."""
+    line = line or ""
+    st = STAMP_RE.search(line)
+    if not st:
+        return None
+    head = line[st.start():st.end() + 24]
+    b = re.search(r"[＝=]\s*柏林\s*(?:(\d{1,2})-(\d{1,2})\s*)?(\d{1,2}):(\d{2}|\dx)", head)
+    if b:
+        return b
+    if re.search(r"box\s*(?:\d{1,2}-\d{1,2}\s*)?$", line[:st.start(3)]):
+        return None                         # only a box time: cannot tell Berlin from it
+    return st
+
+
+def stamp_ahead(line, seen):
+    """Minutes by which a status line's own time is later than when dingo first saw the line
+    (a time written without reading `date`), or None. Undated: only up to 6 h ahead counts."""
+    st = _stamp(line)
+    if not st or not seen:
+        return None
+    if st.group(1):
+        t = _on(st.group(1), st.group(2), st.group(3), st.group(4), seen)
+    else:
+        t = _at(st.group(3), st.group(4), seen)
+        if t is not None and t - seen > 6 * 3600:
+            return None                                     # yesterday's stamp, not a future one
+    if t is None:
+        return None
+    ahead = (t - seen) / 60                                 # "11:2x" counts as 11:20, the earliest it can mean
+    return int(ahead) if ahead > 10 else None
+
+
+def board_rows(r, stale_h):
+    rows = []
+    t = now()
+    for s in sorted(r["sessions"].values(), key=lambda s: (not s.get("alive"), s.get("name") or "")):
+        if not s.get("alive") and t - (s.get("last_seen") or 0) > 86400:
+            continue
+        st, guessed = state_of(s)
+        changed = s.get("status_changed_at") or s.get("last_seen") or t
+        box, eta, written = parse_status(s.get("status_line"), changed)
+        flags = []
+        if s.get("alive") and eta and eta < t and st != "done":
+            flags.append("ask now")                       # its own expected time has passed
+        if s.get("alive") and s.get("status_line") and s.get("status_changed_at") \
+                and t - s["status_changed_at"] > stale_h * 3600 and st != "done":
+            flags.append("may have stopped")
+        ahead = stamp_ahead(s.get("status_line"), s.get("status_changed_at"))
+        if s.get("alive") and ahead:
+            flags.append(f"time {ahead} min ahead")         # the line's own time is later than when it was written
+        rows.append({"name": s.get("name"), "sid": s["sid"][:8], "alive": bool(s.get("alive")),
+                     "state": st + ("?" if guessed else ""), "started": s.get("started_at"),
+                     "last_activity": s.get("last_activity"), "status": s.get("status_line"),
+                     "status_changed": s.get("status_changed_at"), "box": box, "eta": eta,
+                     "log": s.get("log"), "flags": flags})
+    return rows
+
+
+def board_html(rows, title):
+    import html as H
+    esc = lambda x: H.escape(str(x if x is not None else ""))
+    trs = []
+    for b in rows:
+        cls = "warn" if b["flags"] else ("" if b["alive"] else "gone")
+        trs.append("<tr class='%s'><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+                   "<td class='st'>%s</td></tr>" % (cls, esc(b["name"]), esc(b["state"]), esc(b["box"]),
+                                                     esc(hhmm(b["eta"]) if b["eta"] else ""), esc(", ".join(b["flags"])),
+                                                     esc(hhmm(b["last_activity"])), esc(hhmm(b["started"])),
+                                                     esc((b["status"] or "")[:160]) +
+                                                     "".join("<br>⏳ " + esc(w[:160]) for w in b.get("waits") or []) +
+                                                     (f"<br>tokens today {esc(fmt_tok(b['tokens_today']))} · last input "
+                                                      f"{esc(fmt_tok(b.get('last_input')))}" if b.get("tokens_today") is not None else "")))
+    return ("<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='30'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'><title>%s</title><style>"
+            "body{font:14px system-ui,sans-serif;margin:16px;background:#fff;color:#222}"
+            "table{border-collapse:collapse;width:100%%}td,th{border-bottom:1px solid #ddd;padding:4px 6px;"
+            "text-align:left;vertical-align:top}tr.warn{background:#fff3cd}tr.gone{color:#999}td.st{font-size:12px}"
+            "@media (prefers-color-scheme:dark){body{background:#111;color:#ddd}tr.warn{background:#3a3000}"
+            "td,th{border-color:#333}}</style></head><body><h3>%s</h3><table><tr><th>session</th><th>state</th>"
+            "<th>box</th><th>expected</th><th>flags</th><th>last activity</th><th>started</th><th>status line</th>"
+            "</tr>%s</table></body></html>") % (esc(title), esc(title), "".join(trs))
+
+
+def board_tasks(rows):
+    """Add the task-manager facts to board rows: waits, spin and long-context flags, tokens today."""
+    try:
+        tk = {t["sid"][:8]: t for t in session_tasks(sample_s=0) if t.get("sid")}
+    except Exception as e:                  # the board must still show if /proc reading fails
+        eprint(f"dingo-pack board: task facts unavailable ({e})")
+        return rows
+    for b in rows:
+        t = tk.get(b["sid"])
+        if not t:
+            continue
+        if any(w["spin"] for w in t["waits"]):
+            b["flags"].append("spin?")
+        if t["ctx_long"]:
+            b["flags"].append("context long")
+        b["waits"] = [w["text"] + (f" · 🌀 {w['spin']}" if w["spin"] else "") for w in t["waits"]]
+        tok = t.get("tokens")
+        b["tokens_today"] = sum(tok[k] for k in ("input", "cache_write", "cache_read", "output")) if tok else None
+        b["last_input"] = tok.get("last_input") if tok else None
+    return rows
+
+
+def cmd_board(args):
+    while True:
+        r = save_roster(quiet=True) or load_roster()
+        rows = board_tasks(board_rows(r, args.stale_h))
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=1))
+        elif args.html:
+            write_atomic(args.html, board_html(rows, f"dingo-pack board · {time.strftime('%H:%M')}"))
+            print(f"board written: {args.html} ({len(rows)} sessions)")
+        else:
+            if args.watch:
+                sys.stdout.write("\033[2J\033[H")
+            print(f"dingo-pack board · {time.strftime('%H:%M')} · {sum(1 for b in rows if b['alive'])} alive")
+            print(f"  {'session':<24} {'state':<9} {'box':<6} {'expected':<11} {'flags':<20} status")
+            for b in rows:
+                print(f"  {(b['name'] or '?')[:24]:<24} {b['state']:<9} {(b['box'] or ''):<6} "
+                      f"{(hhmm(b['eta']) if b['eta'] else ''):<11} {', '.join(b['flags']):<20} "
+                      f"{(b['status'] or '')[:70]}" + ("" if b["alive"] else "  (gone)"))
+                for w in b.get("waits") or []:
+                    print(f"  {'':<24} ⏳ {w[:110]}")
+            cache = read_json(os.path.join(state_dir(), "boxes.json"), {}) or {}
+            if cache:
+                t0 = min(r.get("probed_at") or 0 for r in cache.values())
+                print(f"\nboxes (dingo-pack boxes, read {hhmm(t0)}; run it again to refresh)")
+                hist = boxes_history()
+                print_boxes([box_row(r, hist) for r in sorted(cache.values(), key=lambda r: (len(r["name"]), r["name"]))])
+        if not args.watch:
+            return EXIT_OK
+        sys.stdout.flush()
+        time.sleep(args.watch)
+
+
+# ---------------------------------------------------------------- 0.3: names, cards, lint, queue, box claims
+
+NAME_RULE = re.compile(r"^([A-Z])(\d*)-(\d{4})-(\S+)$")
+
+
+def today_mmdd():
+    return time.strftime("%m%d")
+
+
+def cmd_name(args):
+    """Next session name for a letter today: L-MMDD-x for the first, then L2-, L3-...;
+    warns if a session of that letter is alive now (one per letter at a time)."""
+    L = args.letter.upper()
+    if not re.fullmatch(r"[A-Z]", L):
+        eprint("dingo-pack name: the letter must be one of A-Z")
+        return EXIT_USAGE
+    r = save_roster(quiet=True) or load_roster()
+    mmdd = args.date or today_mmdd()
+    used, alive = [], []
+    for s_ in r["sessions"].values():
+        m = NAME_RULE.match(s_.get("name") or "")
+        if not m or m.group(1) != L:
+            continue
+        if m.group(3) == mmdd:
+            used.append(int(m.group(2) or 1))
+        if s_.get("alive"):
+            alive.append(s_["name"])
+    n = max(used) + 1 if used else 1
+    suffix = args.what + (f"-{args.suffix}" if args.suffix else "")
+    name = f"{L}{n if n > 1 else ''}-{mmdd}-{suffix}"
+    print(name)
+    if alive:
+        eprint(f"dingo-pack: warning: {', '.join(alive)} is still alive -- one session per letter at a time; "
+               "close it first or take another letter")
+        return 3
+    return EXIT_OK
+
+
+CARD_TEMPLATE = """# {number} · {title}
+
+> Fixed block: assigned to · machine · GPU yes / no · machine lease · read first · may write only · may ask · report format
+> Duplicate check (item 0): what earlier cards / results already said about this; what is new here.
+
+1. Main line:
+2. Which link of the funnel this hits (task · link · how many episodes are lost now · source):
+3. Why it must be done (what each outcome changes):
+4. Feasibility first (probe / intervention / takeover used, and its result):
+5. Can it tell apart (control · noise floor · detectable difference · main metric · criteria written in advance):
+6. Proof it took effect (real-entry smoke · per-step physical quantities · full config diff · watchdog + test alert):
+7. Data / expert (our expert succeeds on x / x of the openings we plan to use; failure causes):
+8. The report must include (success side · failure side · intermediate states · ledger):
+9. Cost (training / evaluation card-hours separately · machine · expected finish · who reports it can be shut down):
+10. Decisions for the human:
+"""
+
+
+def card_numbers(path, rx):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return []
+    return [int(m.group(1)) for m in re.finditer(rx, text)]
+
+
+def cmd_card(args):
+    """`card new`: next free number = 1 + max(numbers in the registry file, numbers reserved
+    here); reserves it locally and writes a skeleton. The registry file itself is only read."""
+    pcfg = project_config(os.getcwd())
+    reg = args.registry or pcfg.get("card_registry")
+    rx = pcfg.get("card_number_regex") or r"\b0-(\d{2,4})\b"
+    prefix = pcfg.get("card_prefix") or "0-"
+    resv = os.path.join(state_dir(), "card-reservations.json")
+    lk = os.open(os.path.join(state_dir(), "card.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        taken = read_json(resv, {}) or {}
+        nums = card_numbers(reg, rx) if reg else []
+        nums += [int(k) for k in taken]
+        n = (max(nums) + 1) if nums else 1
+        number = f"{prefix}{n}"
+        taken[str(n)] = {"by": session_label(args), "t": now(), "title": args.title}
+        write_atomic(resv, json.dumps(taken, ensure_ascii=False, indent=1))
+    finally:
+        os.close(lk)
+    body = (open(pcfg["card_template"], encoding="utf-8").read() if pcfg.get("card_template")
+            else CARD_TEMPLATE).format(number=number, title=args.title)
+    if args.out:
+        if os.path.exists(args.out):
+            eprint(f"dingo-pack card new: {args.out} exists; not overwritten")
+            return EXIT_USAGE
+        write_atomic(args.out, body)
+    print(number)
+    if args.out:
+        print(f"skeleton written: {args.out}")
+    print(f"next free number by {'the ledger ' + reg if reg else 'local reservations'}: {number} -- "
+          "register it in the ledger yourself (or ask whoever keeps it); dingo-pack never edits the ledger")
+    return EXIT_OK
+
+
+LINT_CHECKS = ("name", "letter", "stale", "overdue", "no-status", "future-time")
+
+
+def lint_findings(r, cfg, stale_h):
+    on = cfg.get("lint") or {}
+    want = [c for c in LINT_CHECKS if on.get(c, True)]
+    alive = [s_ for s_ in r["sessions"].values() if s_.get("alive")]
+    out = []
+    by_letter = {}
+    for s_ in alive:
+        name = s_.get("name") or ""
+        m = NAME_RULE.match(name)
+        if "name" in want and not m and s_.get("transcript"):
+            out.append(("name", name, "does not follow L[n]-MMDD-what"))
+        if m:
+            by_letter.setdefault(m.group(1), []).append(name)
+    if "letter" in want:
+        for L, names in sorted(by_letter.items()):
+            if len(names) > 1:
+                out.append(("letter", ", ".join(sorted(names)), f"{len(names)} sessions of letter {L} alive at once"))
+    for b in board_rows(r, stale_h):
+        if not b["alive"]:
+            continue
+        if "stale" in want and "may have stopped" in b["flags"]:
+            out.append(("stale", b["name"], f"status line unchanged for more than {stale_h:g} h"))
+        if "future-time" in want and any(f.startswith("time ") for f in b["flags"]):
+            out.append(("future-time", b["name"], next(f for f in b["flags"] if f.startswith("time ")) +
+                        ": status time later than when it was written (read `date` before writing)"))
+        if "overdue" in want and "ask now" in b["flags"]:
+            out.append(("overdue", b["name"], f"expected finish {hhmm(b['eta'])} has passed"))
+        if "no-status" in want and not b["status"] and b["log"] is None and b["state"] not in ("done",):
+            s_ = r["sessions"].get(next((k for k in r["sessions"] if k.startswith(b["sid"])), ""), {})
+            if s_.get("cwd") and project_config(s_["cwd"]).get("log_glob"):
+                out.append(("no-status", b["name"], "no log with a status line found"))
+    return out
+
+
+def cmd_lint(args):
+    r = save_roster(quiet=True) or load_roster()
+    found = lint_findings(r, config(), args.stale_h)
+    if args.json:
+        print(json.dumps([{"check": c, "who": w, "why": y} for c, w, y in found], ensure_ascii=False, indent=1))
+    else:
+        for c, w, y in found:
+            print(f"⚠️  {c:<9} {w}: {y}")
+        if not found:
+            print("✅ no findings")
+    return 1 if found else EXIT_OK
+
+
+# queue: "when <condition> => to <who> => send <prompt>", conditions checked locally
+def queue_path():
+    return os.path.join(state_dir(), "queue.json")
+
+
+def queue_load():
+    return read_json(queue_path(), {"items": [], "next": 1}) or {"items": [], "next": 1}
+
+
+def cond_met(cond, r):
+    """mark:<name>=<state> | file:<path> | at:<HH:MM> | alive:<name> | gone:<name>"""
+    kind, _, arg = cond.partition(":")
+    if kind == "mark":
+        name, _, st = arg.partition("=")
+        for s_ in r["sessions"].values():
+            if s_.get("name") == name:
+                return state_of(s_)[0] == (st or "done") and not state_of(s_)[1]
+        return False
+    if kind == "file":
+        return os.path.exists(os.path.expanduser(arg))
+    if kind == "at":
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", arg.strip())
+        return bool(m) and now() >= (_at(m.group(1), m.group(2), now()) or 1e18)
+    if kind in ("alive", "gone"):
+        hit = any(s_.get("name") == arg and s_.get("alive") for s_ in r["sessions"].values())
+        return hit if kind == "alive" else not hit
+    raise ValueError(f"unknown condition {cond!r} (mark:, file:, at:, alive:, gone:)")
+
+
+def cmd_queue(args):
+    lk = os.open(os.path.join(state_dir(), "queue.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        q = queue_load()
+        if args.action == "add":
+            for c in args.when:
+                cond_met(c, {"sessions": {}})              # validates the syntax
+            prompt = open(args.prompt_file, encoding="utf-8").read() if args.prompt_file else (args.prompt or "")
+            if not prompt.strip():
+                eprint("dingo-pack queue add: give --prompt or --prompt-file")
+                return EXIT_USAGE
+            item = {"id": q["next"], "when": args.when, "to": args.to, "prompt": prompt, "added": now(),
+                    "by": session_label(args)}
+            q["items"].append(item)
+            q["next"] += 1
+            write_atomic(queue_path(), json.dumps(q, ensure_ascii=False, indent=1))
+            print(f"queued #{item['id']} for {args.to}: when {' and '.join(args.when)}")
+            return EXIT_OK
+        r = save_roster(quiet=True) or load_roster()
+        if args.action == "list":
+            for it in q["items"]:
+                if it.get("sent"):
+                    continue
+                ready = all(cond_met(c, r) for c in it["when"])
+                print(f"  {'🟢 ready' if ready else '⏳ wait '} #{it['id']:<3} to {it['to']:<20} when {' and '.join(it['when'])}"
+                      f"  · {it['prompt'].strip().splitlines()[0][:60]}")
+            if not any(not it.get("sent") for it in q["items"]):
+                print("  (queue empty)")
+            return EXIT_OK
+        it = next((x for x in q["items"] if x["id"] == args.id), None)
+        if not it:
+            eprint(f"dingo-pack queue: no item #{args.id}")
+            return EXIT_USAGE
+        if args.action == "show":
+            sys.stdout.write(it["prompt"] if it["prompt"].endswith("\n") else it["prompt"] + "\n")
+            if args.clip and shutil.which("clip.exe"):
+                subprocess.run(["clip.exe"], input=it["prompt"].encode("utf-16le"))
+                eprint("copied to the Windows clipboard")
+            return EXIT_OK
+        if args.action == "sent":
+            it["sent"] = now()
+            write_atomic(queue_path(), json.dumps(q, ensure_ascii=False, indent=1))
+            print(f"#{it['id']} archived as sent")
+            return EXIT_OK
+    finally:
+        os.close(lk)
+    return EXIT_USAGE
+
+
+# box claims: one line per job in a plain text file on the box. dingo writes
+#   who · task · cards · 预计完成 柏林 MM-DD HH:MM · 完成标志 PATH · 写于 柏林 MM-DD HH:MM
+# and also reads the free-form lines people write by hand ("I-1005-0-202 · GPU 0：… 起 box 01:43 … 预计柏林 10-06 05:05 完").
+# A line whose done flag exists is removed by the next claim command run on that box (check / add / wait / sweep / watch);
+# a line past its expected end + grace, with no compute process on its cards, is "stale": reported and alerted, never deleted.
+CLAIM_SEP = " · "
+CLAIM_TIME = re.compile(r"(?:(柏林|box)\s*)?(?:(\d{1,2})-(\d{1,2})\s+)?(?<![\d:])(\d{1,2}):(\d{2}|\dx)(?!\d)")
+CLAIM_DUR = re.compile(r"预计\s*约?\s*(\d+(?:\.\d+)?)\s*(h|小时|min|分钟)")
+CLAIM_DONE = re.compile(r"(?:完成标志|done=)\s*(\S*/\S*)")      # only a path: "跑完写完成标志" alone is not one
+CLAIM_GPU = re.compile(r"GPU\s*(\d+(?:\s*[-–~]\s*\d+(?![\d.]*\s*(?:worker|进程|个|集|h|min|分))|\s*[/,，、]\s*\d+"
+                       r"|\s+\d+(?![\d.]*\s*(?:worker|进程|个|集|h|min|分)))*)")
+CLAIM_END_WORDS = ("完", "预计", "ETA", "≈", "until")
+CLAIM_GRACE_MIN = 30
+CLAIM_EXIT_BUSY = 3          # someone else's live claim
+CLAIM_EXIT_STALE = 4         # only stale claims are in the way
+
+
+def _zone(label):
+    name = {"柏林": os.environ.get("DINGO_BERLIN_TZ", "Europe/Berlin"),
+            "box": os.environ.get("DINGO_BOX_TZ", "Asia/Shanghai")}.get(label)
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:                       # Python 3.8, or no tz database: never fall back to local time
+        return _FixedZone(label)
+
+
+class _FixedZone(__import__("datetime").tzinfo):
+    """Berlin (CET / CEST by the EU rule) or the box (UTC+8) without a tz database."""
+    def __init__(self, label):
+        self.label = label
+
+    def utcoffset(self, d):
+        import datetime as dt
+        if self.label != "柏林":
+            return dt.timedelta(hours=8)
+        y = d.year
+        last_sun = lambda m: max(dt.datetime(y, m, day) for day in range(25, 32) if dt.datetime(y, m, day).weekday() == 6)
+        start, end = last_sun(3).replace(hour=2), last_sun(10).replace(hour=3)
+        naive = d.replace(tzinfo=None)
+        return dt.timedelta(hours=2 if start <= naive < end else 1)
+
+    def dst(self, d):
+        return None
+
+    def tzname(self, d):
+        return self.label
+
+    def fromutc(self, d):
+        import datetime as dt
+        guess = d + dt.timedelta(hours=1 if self.label == "柏林" else 8)
+        return d + self.utcoffset(guess.replace(tzinfo=None))
+
+
+def _clock(mon, day, hh, mm, tz, ref, after=True):
+    """A wall-clock time in tz as an epoch. With a date: that date in ref's year. Without: the first
+    occurrence after ref (after=True), or the last one at or before ref (after=False)."""
+    import datetime as dt
+    hh = int(hh)
+    mm = int(mm[0]) * 10 if str(mm).endswith("x") else int(mm)
+    if hh > 23 or mm > 59:
+        return None
+    base = dt.datetime.fromtimestamp(ref, tz) if tz else dt.datetime.fromtimestamp(ref)
+    try:
+        d = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if mon:
+            d = d.replace(month=int(mon), day=int(day))
+    except ValueError:
+        return None
+    t = d.timestamp()
+    if not mon:
+        if after and t < ref - 60:
+            t = (d + dt.timedelta(days=1)).timestamp()
+        elif not after and t > ref + 60:
+            t = (d - dt.timedelta(days=1)).timestamp()
+    return t
+
+
+def fmt_berlin(t):
+    import datetime as dt
+    tz = _zone("柏林")
+    d = dt.datetime.fromtimestamp(t, tz) if tz else dt.datetime.fromtimestamp(t)
+    return d.strftime("柏林 %m-%d %H:%M")
+
+
+def claim_times(text):
+    """Every time in a claim line: (start, end, label, mon, day, hh, mm, kind) with kind start / end / other.
+    "起" next to a time = start; any time after an end word ("预计", "完", "≈" ...), or with "完" / "前" right after = end.
+    "box 04:45（＝柏林 22:45）": the two are one instant -- only the Berlin one is kept, with the box one's kind."""
+    out = []
+    zone = None
+    for m in CLAIM_TIME.finditer(text):
+        label = m.group(1)
+        if label:
+            zone = label
+        seg0 = max(text.rfind(c, 0, m.start()) for c in "·；;→，,")
+        pre = text[seg0 + 1:m.start()]
+        post = text[m.end():m.end() + 3]
+        if post.lstrip().startswith("起") or pre.rstrip().endswith("起"):
+            kind = "start"
+        elif any(w in text[:m.start()] for w in CLAIM_END_WORDS) or re.match(r"\s*(前|完)", post):
+            kind = "end"
+        else:
+            kind = "other"
+        item = [m.start(), m.end(), label or zone, m.group(2), m.group(3), m.group(4), m.group(5), kind]
+        gap = text[out[-1][1]:m.start()] if out else None
+        if out and label == "柏林" and gap is not None and len(gap) <= 3 and re.fullmatch(r"\s*[（(]?\s*[＝=]\s*", gap):
+            item[7] = out[-1][7] if out[-1][7] != "other" else kind
+            out[-1] = item                  # the Berlin equivalent replaces the box time
+            continue
+        out.append(item)
+    return out
+
+
+def claim_window(text, written):
+    """(start, end) of a claim line as epochs; either may be None. `written` = when the line was written
+    (its "写于" stamp, else when dingo first saw it, else the file's last change: never earlier than the truth)."""
+    times = claim_times(text)
+    w = re.search(r"写于\s*(柏林|box)?\s*(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})", text)
+    if w:
+        written = _clock(w.group(2), w.group(3), w.group(4), w.group(5), _zone(w.group(1) or "柏林"), written or now()) or written
+        times = [x for x in times if not (x[0] >= w.start() and x[1] <= w.end())]
+    written = written or now()
+    starts = [t for t in (_clock(x[3], x[4], x[5], x[6], _zone(x[2]), written, after=False)
+                          for x in times if x[7] == "start") if t]
+    start = min(starts) if starts else None
+    ref = start or written
+    ends = [x for x in times if x[7] == "end"]
+    if not ends:                            # the bare 0.3 form "who · task · cards · until": times in the 4th field
+        parts = text.split("·")
+        if len(parts) >= 4:
+            lo = len("·".join(parts[:3])) + 1
+            hi = lo + len(parts[3])
+            ends = [x for x in times if lo <= x[0] < hi]
+    end_ts = [t for t in (_clock(x[3], x[4], x[5], x[6], _zone(x[2]), ref) for x in ends) if t]
+    end = max(end_ts) if end_ts else None
+    d = CLAIM_DUR.search(text)
+    if d and start:
+        n = float(d.group(1)) * (3600 if d.group(2) in ("h", "小时") else 60)
+        end = max(end or 0, start + n)
+    return start, end
+
+
+def parse_until(text, written=None):
+    """End time of a claim's 'until' text (kept for the 0.3 callers)."""
+    return claim_window("预计 " + (text or ""), written)[1]
+
+
+def claim_cards(text, field=None):
+    if field is not None and re.fullmatch(r"\s*(无卡|不占卡|不用卡)\s*", field or ""):
+        return set()
+    if re.search(r"不占卡|不用卡", text):
+        return set()                        # copies, downloads: blocks no card (only the same task)
+    if field is not None and re.fullmatch(r"[\d\s,，/、\-–]+", field or ""):
+        return _expand_cards(field) or {"*"}
+    m = CLAIM_GPU.search(text)
+    return _expand_cards(m.group(1)) if m else {"*"}
+
+
+def _expand_cards(text):
+    """'0 1 2' / '0,1' / '0-3' / '0–3' -> {'0', '1', '2', '3'}."""
+    out = set()
+    for a, b in re.findall(r"(\d+)(?:\s*[-–~]\s*(\d+))?", text):
+        lo, hi = int(a), int(b) if b else int(a)
+        if hi - lo > 16 or hi < lo:
+            hi = lo
+        out |= {str(i) for i in range(lo, hi + 1)}
+    return out
+
+
+def card_set(cards):
+    return set(re.findall(r"\d+", cards or "")) or {"*"}
+
+
+def parse_claim(line, written=None):
+    parts = [x.strip() for x in line.strip().split("·")]
+    if len(parts) < 2 or not parts[0]:
+        return None
+    if re.match(r"[^·]{0,40}?[：:]", parts[0]) and not re.match(r"[A-Z]\d*-\d{4}", parts[0]):
+        return None                         # a filled-in template field ("输出目录：… · …"), not a claim
+    who = parts[0][:48]
+    task = parts[1]
+    field = parts[2] if len(parts) > 2 else None
+    cards = claim_cards(line, field)
+    start, end = claim_window(line.strip(), written)
+    done = CLAIM_DONE.search(line)
+    return {"written_t": claim_written(line), "who": who, "task": task, "cards": ",".join(sorted(cards)), "card_set": cards,
+            "until": parts[3] if len(parts) > 3 else "", "start_t": start, "until_t": end,
+            "done_flag": done.group(1).rstrip("）),;；。") if done else None, "line": line.rstrip("\n")}
+
+
+def claim_file(args):
+    f = args.file or os.environ.get("DINGO_CLAIM_FILE")
+    if not f:
+        eprint("dingo-pack claim: say --file /root/gpufree-data/CLAIM_boxNN.txt (or set DINGO_CLAIM_FILE)")
+        sys.exit(EXIT_USAGE)
+    return f
+
+
+def _seen_path(path):
+    return path + ".seen.json"
+
+
+def _line_key(line):
+    import hashlib
+    return hashlib.sha1(line.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def _note_seen(path):
+    """Before dingo rewrites the file (which moves its mtime), remember for each line the latest time it
+    can have been written (the current mtime), so undated times in older lines keep their day."""
+    try:
+        mt = os.path.getmtime(path)
+        with open(path, encoding="utf-8") as f:
+            lines = [x for x in f if x.strip()]
+    except FileNotFoundError:
+        return
+    seen = read_json(_seen_path(path), {}) or {}
+    keys = set()
+    for x in lines:
+        k = _line_key(x)
+        keys.add(k)
+        seen[k] = min(seen.get(k, mt), mt)
+    write_atomic(_seen_path(path), json.dumps({k: v for k, v in seen.items() if k in keys}))
+
+
+def read_claims(path):
+    try:
+        mt = os.path.getmtime(path)
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return []
+    seen = read_json(_seen_path(path), {}) or {}
+    out = []
+    for x in lines:
+        if not x.strip() or x.lstrip().startswith("#"):
+            continue
+        c = parse_claim(x, min(seen.get(_line_key(x), mt), mt))
+        if c:
+            c["base"] = os.path.dirname(os.path.abspath(path))
+            out.append(c)
+    return out
+
+
+def gpu_procs():
+    """{card index: [(pid, MiB)]} from nvidia-smi, or None when it is not there / fails."""
+    exe = os.environ.get("DINGO_NVSMI", "nvidia-smi")
+    try:
+        g = subprocess.run([exe, "--query-gpu=index,uuid", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=20)
+        a = subprocess.run([exe, "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if g.returncode != 0 or a.returncode != 0:
+        return None
+    idx = {}
+    for row in g.stdout.splitlines():
+        p = [x.strip() for x in row.split(",")]
+        if len(p) >= 2:
+            idx[p[1]] = p[0]
+    out = {i: [] for i in idx.values()}
+    for row in a.stdout.splitlines():
+        p = [x.strip() for x in row.split(",")]
+        if len(p) >= 2 and p[0] in idx:
+            mem = re.match(r"\d+", p[2]) if len(p) > 2 else None
+            out[idx[p[0]]].append((p[1], int(mem.group()) if mem else 0))
+    return out
+
+
+def done_flag_hit(c, base=None):
+    """The line's done flag exists and is not older than the line (a flag left by an earlier job does not
+    count). A relative path is taken from the claim file's directory, never from the caller's cwd."""
+    flag = c.get("done_flag")
+    if not flag:
+        return False
+    if not os.path.isabs(flag):
+        flag = os.path.join(base or c.get("base") or "/nonexistent", flag)
+    since = c.get("written_t") or c.get("start_t")
+    try:                                    # a literal regular file: no globs, not a directory
+        return os.path.isfile(flag) and (since is None or os.path.getmtime(flag) >= since - 60)
+    except OSError:
+        return False
+
+
+def claim_written(text):
+    w = re.search(r"写于\s*(柏林|box)?\s*(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})", text or "")
+    return _clock(w.group(2), w.group(3), w.group(4), w.group(5), _zone(w.group(1) or "柏林"), now()) if w else None
+
+
+def claim_state(c, procs, grace_min=CLAIM_GRACE_MIN):
+    """done (flag is there) / live / overdue (past end + grace, cards still computing) / stale (past end +
+    grace, no compute process on its cards, or nvidia-smi unknown) / open (no end time found)."""
+    if done_flag_hit(c):
+        return "done"
+    if c["until_t"] is None:
+        return "open"
+    if now() <= c["until_t"] + grace_min * 60:
+        return "live"
+    if procs is None:
+        return "stale"
+    cards = procs.keys() if "*" in c["card_set"] else c["card_set"]
+    return "overdue" if any(procs.get(k) for k in cards) else "stale"
+
+
+CLAIM_STATE_TEXT = {"done": "✅ 完成标志已在（下一次 claim 命令自动删）", "live": "在用", "open": "⚠️ 没写预计完成",
+                    "overdue": "⏰ 已超预计、卡上仍有计算进程", "stale": "🟡 疑似过期（已超预计 + 宽限、卡上没有计算进程）"}
+
+
+def sweep_claims(path):
+    """Remove the lines whose done flag exists; the removed lines go to <file>.released. Returns them."""
+    lk = os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        base = os.path.dirname(os.path.abspath(path))
+        for _ in range(5):
+            try:
+                st0 = os.stat(path)
+                with open(path, encoding="utf-8") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                return []
+            seen = read_json(_seen_path(path), {}) or {}
+            keep, gone = [], []
+            for x in lines:
+                c = parse_claim(x, min(seen.get(_line_key(x), st0.st_mtime), st0.st_mtime)) \
+                    if x.strip() and not x.lstrip().startswith("#") else None
+                if c and done_flag_hit(c, base):
+                    gone.append(c)
+                else:
+                    keep.append(x)
+            if not gone:
+                return []
+            _note_seen(path)
+            st1 = os.stat(path)
+            # people append by hand (echo >>) without our lock: if the file moved since we read it,
+            # read again rather than replace it with a copy that misses their line
+            if (st1.st_size, st1.st_mtime_ns, st1.st_ino) == (st0.st_size, st0.st_mtime_ns, st0.st_ino):
+                write_atomic(path, "".join(keep))
+                break
+            time.sleep(0.2)
+        else:
+            eprint(f"dingo-pack claim: {path} kept changing; did not remove anything this time")
+            return []
+        if gone:
+            with open(path + ".released", "a", encoding="utf-8") as f:
+                for c in gone:
+                    f.write(f"{fmt_berlin(now())} 完成标志 {c['done_flag']} 已在 ⇒ 删行：{c['line']}\n")
+        return gone
+    finally:
+        fcntl.flock(lk, fcntl.LOCK_UN)
+        os.close(lk)
+
+
+def claim_alert(path, alert, msgs):
+    """One line per stale claim into an alert file the box watchdog already watches (runs/*.alert)."""
+    if not alert or not msgs:
+        return
+    try:
+        with open(alert, encoding="utf-8") as f:
+            old = f.read()
+    except OSError:
+        old = ""
+    msgs = [m for m in msgs if m not in old]          # each stale line once: the watchdog alerts on every change
+    if not msgs:
+        return
+    try:
+        with open(alert, "a", encoding="utf-8") as f:
+            for m in msgs:
+                f.write(f"{fmt_berlin(now())} {m}\n")
+    except OSError as e:
+        eprint(f"dingo-pack claim: could not write the alert file {alert}: {e}")
+
+
+def default_alert(path):
+    runs = os.path.join(os.path.dirname(os.path.abspath(path)), "runs")
+    if os.path.isdir(runs):
+        return os.path.join(runs, "claim_stale_" + os.path.splitext(os.path.basename(path))[0] + ".alert")
+    return None
+
+
+def claim_blockers(claims, who, cards, task, procs, grace):
+    mine = card_set(cards) if cards else {"*"}
+    out = []
+    for c in claims:
+        if c["who"] == who:
+            continue
+        st = claim_state(c, procs, grace)
+        if st == "done":
+            continue
+        overlap = bool(c["card_set"]) and ("*" in mine or "*" in c["card_set"] or bool(mine & c["card_set"]))
+        same = bool(task) and c["task"].strip() == task.strip()
+        if overlap or same:
+            out.append((c, st, overlap))
+    return out
+
+
+def stale_msg(c, path):
+    box = os.path.splitext(os.path.basename(path))[0].replace("CLAIM_", "")
+    return (f"{box} CLAIM 疑似过期：{c['who']} 卡 {c['cards']} 预计 {fmt_berlin(c['until_t'])} 已过、"
+            f"卡上没有计算进程；问持有者删行（dingo 不删）")
+
+
+def cmd_claim(args):
+    path = claim_file(args)
+    who = args.who or session_label(args)
+    grace = args.grace
+    if args.action == "sweep":
+        gone = sweep_claims(path)
+        for c in gone:
+            print(f"removed (done flag {c['done_flag']} is there): {c['line']}")
+        print(f"removed {len(gone)} line(s)")
+        return EXIT_OK
+    if args.action == "list":
+        claims = read_claims(path)
+        procs = gpu_procs()
+        rows = []
+        for c in claims:
+            st = claim_state(c, procs, grace)
+            rows.append(dict({k: v for k, v in c.items() if k != "card_set"}, state=st))
+        if args.json:
+            print(json.dumps({"file": path, "now": now(), "gpu_procs": procs, "claims": rows}, ensure_ascii=False))
+            return EXIT_OK
+        for r in rows:
+            end = fmt_berlin(r["until_t"]) if r["until_t"] else "?"
+            print(f"  {r['who']:<22} 卡 {r['cards']:<6} 预计 {end:<16} {CLAIM_STATE_TEXT[r['state']]}")
+        if not rows:
+            print("  (nobody)")
+        if procs is None:
+            print("  (nvidia-smi not available: stale = by time only)")
+        claim_alert(path, args.alert, [stale_msg(c, path) for c, r in zip(claims, rows) if r["state"] == "stale"])
+        return EXIT_OK
+    if args.action == "remove":
+        lk = os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                lines = []
+            keep, removed = [], 0
+            for x in lines:
+                c = parse_claim(x) if x.strip() and not x.lstrip().startswith("#") else None
+                if c and c["who"] == who and (not args.task or c["task"].strip() == args.task.strip()):
+                    removed += 1
+                else:
+                    keep.append(x)
+            if removed:
+                _note_seen(path)
+                write_atomic(path, "".join(keep))
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+            os.close(lk)
+        print(f"removed {removed} line(s) of {who}")
+        return EXIT_OK
+    if args.action not in ("check", "add", "wait"):
+        return EXIT_USAGE
+    alert = args.alert or default_alert(path)
+    alerted = set()
+    deadline = now() + parse_duration(args.timeout) if getattr(args, "timeout", None) else None
+    while True:
+        for c in sweep_claims(path):
+            print(f"auto-released (done flag {c['done_flag']} is there): {c['line']}")
+        procs = gpu_procs()
+        blockers = claim_blockers(read_claims(path), who, args.cards, args.task, procs, grace)
+        live = [b for b in blockers if b[1] != "stale"]
+        stale = [b for b in blockers if b[1] == "stale"]
+        if args.action != "wait" or not blockers or (not live and args.take_stale):
+            break
+        new = [stale_msg(c, path) for c, _, _ in stale if c["line"] not in alerted]
+        if not live and new:
+            for m in new:
+                print(f"🟡 {m}")
+            claim_alert(path, alert, new)
+            alerted.update(c["line"] for c, _, _ in stale)
+            if args.stop_on_stale:
+                return CLAIM_EXIT_STALE
+        if deadline and now() >= deadline:
+            print("timed out while waiting for the claim(s) below")
+            break
+        time.sleep(args.every)
+    for c, st, overlap in blockers:
+        if st == "stale":
+            print(f"🟡 stale: {c['line']}")
+            print(f"   预计 {fmt_berlin(c['until_t'])} + 宽限 {grace} min 已过、卡上没有计算进程：问持有者或聊天侧，⛔ 不擅自删")
+        elif overlap:
+            print(f"⛔ in use{' (overdue, cards busy)' if st == 'overdue' else ''}: {c['line']}")
+        else:
+            print(f"⚠️  same task already claimed: {c['line']}")
+    if stale and args.action != "wait":
+        claim_alert(path, alert, [stale_msg(c, path) for c, _, _ in stale])
+    if blockers and not (not live and args.take_stale):
+        print("stop and report (someone else holds this box / these cards)")
+        if args.action == "wait" and deadline and now() >= deadline:
+            return EXIT_TIMEOUT
+        return CLAIM_EXIT_BUSY if live else CLAIM_EXIT_STALE
+    if stale:
+        print("taking over stale claim(s) (--take-stale)")
+    for c in sweep_claims(path):            # a flag that appeared after the sweep above
+        print(f"auto-released (done flag {c['done_flag']} is there): {c['line']}")
+    if args.action in ("check", "wait"):
+        print("free")
+        return EXIT_OK
+    if not (args.task and args.cards and args.until):
+        eprint("dingo-pack claim add: give --task, --cards and --until (and --done FLAG, so the line removes itself)")
+        return EXIT_USAGE
+    _, end = claim_window("预计 " + args.until, now())
+    if end is None or end < now() - 60:
+        eprint(f"dingo-pack claim add: cannot read a future time in --until {args.until!r} (write e.g. '柏林 10-06 05:05')")
+        return EXIT_USAGE
+    if args.done and (not os.path.isabs(args.done) or os.path.exists(args.done) or any(ch in args.done for ch in "*?[")):
+        eprint(f"dingo-pack claim add: --done must be an absolute path that does not exist yet (no wildcards): {args.done}")
+        return EXIT_USAGE
+    fields = [who, args.task, args.cards, "预计完成 " + fmt_berlin(end)]
+    if args.done:
+        fields.append("完成标志 " + args.done)
+    else:
+        eprint("⚠️  no --done flag: remove the line yourself when the job ends (dingo-pack claim remove)")
+    fields.append("写于 " + fmt_berlin(now()))
+    line = CLAIM_SEP.join(fields)
+    lk = os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        # again under the lock: another `claim add` may have taken the cards since the check above
+        again = claim_blockers(read_claims(path), who, args.cards, args.task, gpu_procs(), grace)
+        if [b for b in again if b[1] != "stale" or not args.take_stale]:
+            for c, st, _ in again:
+                print(f"⛔ in use (just added): {c['line']}")
+            print("stop and report (someone else holds this box / these cards)")
+            return CLAIM_EXIT_BUSY
+        _note_seen(path)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    finally:
+        fcntl.flock(lk, fcntl.LOCK_UN)
+        os.close(lk)
+    print(f"claimed: {line}")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------- boxes (read-only ssh)
+# `dingo-pack boxes` sends this very file over one ssh per box (`python3 - _probe`): nothing is installed
+# or written there; the probe only reads (nvidia-smi, df, du, tmux ls, ps, the watchdog files, CLAIM_*.txt).
+BOX_STATES = {"ok": "在线有卡", "nogpu": "在线无卡", "fewer": "卡少了", "down": "连不上", "unknown": "没查过"}
+BOX_BAD = ("nogpu", "fewer", "down")
+PROBE_PROC = re.compile(r"python|torchrun|\btar\b|rsync|\bdu\b|hf_hub|huggingface-cli")
+PROBE_SKIP = re.compile(r"jupyter|box_watchdog|_probe|ipykernel|unattended-upgrade|networkd-dispatcher")
+
+
+def _sh(cmd, timeout=30):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, "", str(e)
+
+
+def probe_here(data, du=True):
+    """Runs on the box. Everything it reports is read, nothing is written."""
+    r = {"now": now(), "host": socket.gethostname(), "data": data}
+    try:
+        with open("/proc/uptime") as f:
+            r["boot"] = now() - float(f.read().split()[0])
+    except (OSError, ValueError):
+        r["boot"] = None
+    rc, out, err = _sh([os.environ.get("DINGO_NVSMI", "nvidia-smi"), "-L"])
+    r["gpus"] = sum(1 for x in out.splitlines() if x.startswith("GPU ")) if rc == 0 else 0
+    r["gpu_error"] = None if rc == 0 else ((err or out).strip().splitlines() or ["nvidia-smi not found"])[-1][:120]
+    r["gpu_procs"] = gpu_procs() if rc == 0 else None
+    r["disks"] = {}
+    for p in (data, "/"):
+        try:
+            u = shutil.disk_usage(p)
+            r["disks"][p] = {"used": u.used, "total": u.total}
+        except OSError:
+            pass
+    r["du"] = []
+    if du and os.path.isdir(data):
+        rc, out, _ = _sh(["timeout", "90", "du", "-x", "-B1", "--max-depth=1", data], timeout=100)
+        rows = []
+        for x in out.splitlines():
+            p = x.split("\t", 1)
+            if len(p) == 2 and p[0].isdigit() and os.path.normpath(p[1]) != os.path.normpath(data):
+                rows.append((int(p[0]), os.path.basename(p[1])))
+        r["du"] = sorted(rows, reverse=True)[:12]
+        r["du_complete"] = rc == 0
+    rc, out, _ = _sh(["tmux", "ls", "-F", "#{session_name}"])
+    r["tmux"] = out.split() if rc == 0 else []
+    rc, out, _ = _sh(["ps", "-eo", "pid=,etimes=,pcpu=,rss=,args="])
+    procs = []
+    me = {str(os.getpid()), str(os.getppid())}
+    for x in out.splitlines():
+        p = x.split(None, 4)
+        if len(p) == 5 and p[0] not in me and PROBE_PROC.search(p[4]) and not PROBE_SKIP.search(p[4]):
+            procs.append({"pid": p[0], "age_s": int(p[1]) if p[1].isdigit() else None, "cpu": p[2],
+                          "rss_mb": int(p[3]) // 1024 if p[3].isdigit() else None, "cmd": p[4][:100]})
+    r["procs"] = procs[:30]
+    wd = os.path.join(data, "watchdog")
+    w = {"present": os.path.isdir(wd)}
+    if w["present"]:
+        try:
+            w["heartbeat_age_s"] = now() - os.path.getmtime(os.path.join(wd, "HEARTBEAT"))
+        except OSError:
+            w["heartbeat_age_s"] = None
+        w["targets"] = sorted(os.path.splitext(os.path.basename(x))[0]
+                              for x in glob.glob(os.path.join(wd, "targets.d", "*.json")))
+        try:
+            with open(os.path.join(wd, "alerts.log"), encoding="utf-8", errors="replace") as f:
+                w["alerts_tail"] = [x.rstrip()[:160] for x in f.readlines()[-3:]]
+        except OSError:
+            w["alerts_tail"] = []
+    r["watchdog"] = w
+    claims = []
+    for path in sorted(glob.glob(os.path.join(data, "CLAIM_*.txt"))):
+        for c in read_claims(path):
+            row = {k: v for k, v in c.items() if k != "card_set"}
+            row["state"] = claim_state(c, r["gpu_procs"])
+            row["file"] = os.path.basename(path)
+            claims.append(row)
+    r["claims"] = claims
+    return r
+
+
+def cmd_probe(args):
+    print(json.dumps(probe_here(args.data, du=not args.no_du), ensure_ascii=False))
+    return EXIT_OK
+
+
+def boxes_file(args=None):
+    return (getattr(args, "boxes", None) or os.environ.get("DINGO_BOXES")
+            or os.path.join(os.path.expanduser("~/.config/dingo-pack"), "boxes.json"))
+
+
+def load_boxes(args=None):
+    """[{"name", "host", "gpus" (expected), "data", ...}] from boxes.json; without one, the box* hosts
+    in ~/.ssh/config (expected card count unknown)."""
+    j = read_json(boxes_file(args), None)
+    if isinstance(j, dict):
+        j = j.get("boxes")
+    if isinstance(j, dict):                 # {"box22": {"ssh": "box22", "gpus": 4, ...}} (T2's table)
+        j = [dict(v, name=k) for k, v in j.items() if isinstance(v, dict)]
+    if isinstance(j, list):
+        out = []
+        for b in j:
+            if isinstance(b, dict) and b.get("name"):
+                e = dict({"gpus": None, "data": "/root/gpufree-data"}, **b)
+                e["host"] = b.get("host") or b.get("ssh") or b["name"]
+                out.append(e)
+        return sorted(out, key=lambda b: (len(b["name"]), b["name"]))
+    hosts = []
+    try:
+        with open(os.path.expanduser("~/.ssh/config")) as f:
+            for x in f:
+                m = re.match(r"\s*Host\s+(.+)", x)
+                if m:
+                    hosts += [h for h in m.group(1).split() if re.fullmatch(r"box\d+", h)]
+    except OSError:
+        pass
+    return [{"name": h, "host": h, "gpus": None, "data": "/root/gpufree-data"}
+            for h in sorted(set(hosts), key=lambda h: int(h[3:]))]
+
+
+def probe_box(b, du=True, timeout=150):
+    ssh = os.environ.get("DINGO_SSH", "ssh")
+    src = open(os.path.realpath(__file__), encoding="utf-8").read()
+    cmd = "python3 - _probe --data " + shlex.quote(b.get("data") or "/root/gpufree-data") + ("" if du else " --no-du")
+    t0 = now()
+    try:
+        p = subprocess.run([ssh, "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", b["host"], cmd],
+                           input=src, capture_output=True, text=True, timeout=timeout)
+        rc, out, err = p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        rc, out, err = None, "", f"no answer in {timeout}s"
+    except OSError as e:
+        rc, out, err = None, "", str(e)
+    try:
+        r = json.loads(out.strip().splitlines()[-1]) if rc == 0 and out.strip() else None
+    except ValueError:
+        r = None
+    if r is None:
+        return {"name": b["name"], "state": "down", "error": ((err or out).strip().splitlines() or ["?"])[-1][:160],
+                "probed_at": now(), "took_s": round(now() - t0, 1)}
+    want = b.get("gpus")
+    if not r["gpus"]:
+        st = "nogpu" if want != 0 else "ok"
+    elif want and r["gpus"] < want:
+        st = "fewer"
+    else:
+        st = "ok"
+    r.update(name=b["name"], state=st, expected_gpus=want, probed_at=now(), took_s=round(now() - t0, 1))
+    return r
+
+
+def boxes_log_path():
+    return os.path.join(state_dir(), "boxes.log.jsonl")
+
+
+def boxes_log(rec):
+    with open(boxes_log_path(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def boxes_history(name=None):
+    out = []
+    try:
+        with open(boxes_log_path(), encoding="utf-8") as f:
+            for x in f:
+                try:
+                    e = json.loads(x)
+                except ValueError:
+                    continue
+                if name is None or e.get("box") == name:
+                    out.append(e)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def _gb(n):
+    return f"{n / 2 ** 30:.0f}G" if n is not None else "?"
+
+
+def box_users(r):
+    """Who is on the box: claim lines (with their state) + cards computing without a claim line."""
+    out = []
+    covered = set()
+    for c in r.get("claims") or []:
+        mark = {"live": "", "open": "", "overdue": "⏰", "stale": "🟡疑似过期", "done": "✅待删"}.get(c["state"], "")
+        out.append(f"{c['who']}[{c['cards']}]{mark}")
+        if c["state"] in ("live", "open", "overdue"):
+            covered |= set(c["cards"].split(","))
+    for k, ps in sorted((r.get("gpu_procs") or {}).items()):
+        if ps and k not in covered and "*" not in covered:
+            out.append(f"卡{k}:{len(ps)}进程无登记")
+    return out
+
+
+def box_row(r, hist):
+    fails = [e for e in hist if e.get("box") == r["name"] and (e.get("kind") == "note" or e.get("state") in BOX_BAD)]
+    last = fails[-1] if fails else None
+    lastfail = (f"{hhmm(last['t'])} {last.get('text') or BOX_STATES.get(last.get('state'), '')}"[:60]) if last else ""
+    if r["state"] == "down":
+        return {"box": r["name"], "state": BOX_STATES["down"], "cards": "", "users": "", "disk": "", "dirs": "",
+                "heartbeat": "", "last_fail": lastfail, "error": r.get("error", "")}
+    d = (r.get("disks") or {}).get(r.get("data")) or {}
+    w = r.get("watchdog") or {}
+    hb = w.get("heartbeat_age_s")
+    return {"box": r["name"], "state": BOX_STATES[r["state"]],
+            "cards": f"{r['gpus']}/{r['expected_gpus'] if r.get('expected_gpus') is not None else '?'}",
+            "users": " ".join(box_users(r)), "disk": f"{_gb(d.get('used'))}/{_gb(d.get('total'))}",
+            "dirs": " ".join(f"{n} {_gb(s)}" for s, n in (r.get("du") or [])[:4]),
+            "heartbeat": ("无看门狗" if not w.get("present") else "无心跳" if hb is None else f"{int(hb // 60)}min前"),
+            "last_fail": lastfail, "error": r.get("gpu_error") or ""}
+
+
+def cmd_boxes(args):
+    w = list(args.words or [])
+    args.action = w.pop(0) if w and w[0] in ("show", "note", "history") else "show"
+    args.names, args.text = (w[:1], " ".join(w[1:])) if args.action == "note" else (w, "")
+    if args.action == "note":
+        if not args.names or not args.text:
+            eprint('dingo-pack boxes note BOX "what happened"')
+            return EXIT_USAGE
+        for n in args.names:
+            boxes_log({"t": now(), "box": n, "kind": "note", "by": session_label(args), "text": args.text})
+        print(f"noted for {', '.join(args.names)}")
+        return EXIT_OK
+    if args.action == "history":
+        for e in boxes_history(args.names[0] if args.names else None):
+            what = e.get("text") or (BOX_STATES.get(e.get("state"), e.get("state", "")) + (f" · {e['detail']}" if e.get("detail") else ""))
+            print(f"  {hhmm(e['t'])}  {e.get('box', '?'):<7} {e.get('kind', ''):<5} {e.get('by', ''):<16} {what}")
+        return EXIT_OK
+    boxes = load_boxes(args)
+    if args.names:
+        boxes = [b for b in boxes if b["name"] in args.names] + \
+                [{"name": n, "host": n, "gpus": None, "data": "/root/gpufree-data"}
+                 for n in args.names if n not in {b["name"] for b in boxes}]
+    if not boxes:
+        eprint(f"dingo-pack boxes: no boxes (write {boxes_file(args)} or add box* hosts to ~/.ssh/config)")
+        return EXIT_USAGE
+    cache_path = os.path.join(state_dir(), "boxes.json")
+    while True:
+        import concurrent.futures as cf
+        with cf.ThreadPoolExecutor(max_workers=min(8, len(boxes))) as ex:
+            res = list(ex.map(lambda b: probe_box(b, du=not args.no_du, timeout=args.ssh_timeout), boxes))
+        cache = read_json(cache_path, {}) or {}
+        for r in res:
+            prev = (cache.get(r["name"]) or {}).get("state")
+            if r["state"] != prev and (r["state"] in BOX_BAD or prev in BOX_BAD):
+                detail = r.get("error") or r.get("gpu_error") or (
+                    f"{r.get('gpus')}/{r.get('expected_gpus')} 卡" if r["state"] == "fewer" else "")
+                boxes_log({"t": now(), "box": r["name"], "kind": "auto", "by": "boxes", "state": r["state"],
+                           "prev": prev, "detail": detail})
+            cache[r["name"]] = r
+        write_atomic(cache_path, json.dumps(cache, ensure_ascii=False))
+        hist = boxes_history()
+        rows = [box_row(r, hist) for r in res]
+        if args.json:
+            print(json.dumps(res, ensure_ascii=False))
+        else:
+            if args.every:
+                sys.stdout.write("\033[2J\033[H")
+            print(f"dingo-pack boxes · {time.strftime('%H:%M')} · {sum(1 for r in res if r['state'] == 'ok')}/{len(res)} 在线有卡")
+            print_boxes(rows)
+        if not args.every:
+            return EXIT_OK
+        sys.stdout.flush()
+        time.sleep(args.every)
+
+
+def print_boxes(rows):
+    print(f"  {'box':<7} {'状态':<6} {'卡':<5} {'数据盘':<10} {'看门狗':<8} 谁在用 · 主要目录 · 最近开机失败")
+    for b in rows:
+        extra = " · ".join(x for x in (b["users"], b["dirs"], (f"⚠️ {b['last_fail']}" if b["last_fail"] else ""),
+                                       b["error"]) if x)
+        print(f"  {b['box']:<7} {b['state']:<6} {b['cards']:<5} {b['disk']:<10} {b['heartbeat']:<8} {extra}")
+
+
+# ---------------------------------------------------------------- top / overview
+
+# ---------------------------------------------------------------- adapters (see ADAPTERS.md)
+# What dingo-pack needs to know about one kind of agent: its live sessions, its transcripts, its hooks.
+class ClaudeCodeAdapter:
+    name = "claude-code"
+    owner_env = "CLAUDE_PID"
+
+    def sessions(self):
+        out = []
+        for p in glob.glob(os.path.join(claude_home(), "sessions", "*.json")):
+            e = read_json(p)
+            if not isinstance(e, dict) or "pid" not in e or not pid_alive(e.get("pid"), e.get("procStart")):
+                continue
+            st = e.get("startedAt")
+            out.append({"id": e.get("sessionId"), "pid": int(e["pid"]),
+                        "name": e.get("name") if e.get("nameSource") == "user" else None,
+                        "cwd": e.get("cwd"), "proc_start": e.get("procStart"), "status": e.get("status"),
+                        "started_at": st / 1000 if isinstance(st, (int, float)) and st > 1e11 else st,
+                        "fallback_name": e.get("name")})
+        return out
+
+    def transcript(self, session_id):
+        return find_transcript(session_id) if session_id else None
+
+    def subtranscripts(self, session_id, path):
+        return glob.glob(os.path.join(os.path.dirname(path), session_id, "subagents", "*.jsonl")) if path else []
+
+    def usage(self, path, cache):
+        return transcript_usage(path, cache)        # keeps its state in cache[path]
+
+    def hooks(self):
+        return "/plugin install dingo-pack@dingo-pack, or the hooks snippet in REFERENCE.md"
+
+
+BUILTIN_ADAPTERS = {"claude-code": ClaudeCodeAdapter}
+
+
+def load_adapters(spec=None):
+    """DINGO_AGENTS: comma-separated built-in names and paths to adapter files (default claude-code)."""
+    out = []
+    for item in (spec or os.environ.get("DINGO_AGENTS") or "claude-code").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item in BUILTIN_ADAPTERS:
+            out.append(BUILTIN_ADAPTERS[item]())
+            continue
+        path = os.path.expanduser(item)
+        if not os.path.isfile(path):
+            path = os.path.join(os.path.expanduser("~/.config/dingo-pack/adapters"), item + ".py")
+        try:
+            import importlib.util
+            spec_ = importlib.util.spec_from_file_location("dingo_adapter_" + re.sub(r"\W", "_", item), path)
+            mod = importlib.util.module_from_spec(spec_)
+            spec_.loader.exec_module(mod)
+            out.append(mod.ADAPTER)
+        except Exception as e:              # a broken adapter must not take the board down
+            eprint(f"dingo-pack: adapter {item!r} not loaded: {e}")
+    return out
+
+
+def adapter_usage(ad, sid, day, cache):
+    """Token totals of one session through its adapter (same shape as session_tokens), or None."""
+    path = ad.transcript(sid)
+    if not path:
+        return None
+    key = lambda p: f"{getattr(ad, 'name', '?')}:{p}"
+    sub_cache = cache.setdefault(key(path), {})
+    c = ad.usage(path, sub_cache)
+    tot = list((c or {}).get("days", {}).get(day, [0] * 5)) if c else [0] * 5
+    sub = [0] * 5
+    for sp_ in ad.subtranscripts(sid, path) or []:
+        sc = ad.usage(sp_, cache.setdefault(key(sp_), {}))
+        if sc:
+            sub = [a + b for a, b in zip(sub, sc.get("days", {}).get(day, [0] * 5))]
+    return {"day": day, "input": tot[0], "cache_write": tot[1], "cache_read": tot[2], "output": tot[3], "turns": tot[4],
+            "last_input": (c or {}).get("last_input"), "sub": sum(sub[:4])}
+
+
+ADAPTER_KEYS = {"id": str, "pid": int}
+
+
+def cmd_adapter(args):
+    """Check adapters against the live machine: shapes, live pids, transcripts, usage numbers, read-only."""
+    bad, n = [], 0
+    for ad in load_adapters(args.agents):
+        nm = getattr(ad, "name", "?")
+        for attr in ("name", "owner_env", "sessions", "transcript", "subtranscripts", "usage", "hooks"):
+            if not hasattr(ad, attr):
+                bad.append(f"{nm}: missing {attr}")
+        if any(b.startswith(f"{nm}: missing") for b in bad):
+            continue
+        try:
+            ss = ad.sessions()
+        except Exception as e:
+            bad.append(f"{nm}: sessions() raised {e!r}")
+            continue
+        if not isinstance(ss, list):
+            bad.append(f"{nm}: sessions() must return a list")
+            continue
+        for s in ss:
+            n += 1
+            if not isinstance(s, dict):
+                bad.append(f"{nm}: a session is not a dict: {s!r}"[:120])
+                continue
+            for k, t in ADAPTER_KEYS.items():
+                if not isinstance(s.get(k), t) or isinstance(s.get(k), bool):
+                    bad.append(f"{nm}: session {s.get('id')!r}: {k} must be {t.__name__}, got {s.get(k)!r}"[:160])
+            if isinstance(s.get("pid"), int) and not pid_alive(s["pid"], s.get("proc_start")):
+                bad.append(f"{nm}: session {s.get('id')!r}: pid {s['pid']} is not alive")
+            path = ad.transcript(s.get("id")) if isinstance(s.get("id"), str) else None
+            if path is None:
+                continue
+            if not os.path.isfile(path):
+                bad.append(f"{nm}: session {s.get('id')!r}: transcript {path} does not exist")
+                continue
+            before = (os.path.getmtime(path), os.path.getsize(path))
+            quiet = now() - before[0] > 60          # a transcript being written right now cannot show a read-only breach
+            try:
+                u = ad.usage(path, {})
+            except Exception as e:
+                bad.append(f"{nm}: usage({path}) raised {e!r}")
+                continue
+            if u is not None:
+                days = u.get("days") if isinstance(u, dict) else None
+                if not isinstance(days, dict) or any(not isinstance(v, list) or len(v) != 5 or
+                                                     any(not isinstance(x, int) or x < 0 for x in v) for v in days.values()):
+                    bad.append(f"{nm}: usage({os.path.basename(path)}): days must map YYYY-MM-DD to 5 non-negative ints")
+            if quiet and (os.path.getmtime(path), os.path.getsize(path)) != before:
+                bad.append(f"{nm}: reading {os.path.basename(path)} changed it (adapters must only read)")
+    for b in bad:
+        print(f"  ✗ {b}")
+    print(f"adapter test: {n} session(s) checked, {len(bad)} problem(s)")
+    return EXIT_OK if not bad else 1
+
+
+# ---------------------------------------------------------------- task manager: children, waits, tokens
+CTX_WARN = int(os.environ.get("DINGO_CTX_WARN", "600000"))       # last turn's input tokens => "context long, start fresh"
+SPIN_H = float(os.environ.get("DINGO_SPIN_H", "3"))               # a wait older than this whose target never changed
+AGENT_OUT_H = float(os.environ.get("DINGO_AGENT_OUT_H", "1"))     # a waited-on sub-agent output untouched this long
+CHILD_MIN_S = 60
+LOOP_RE = re.compile(r"\b(until|while)\s+(.+?);\s*do\b(.*?)\bdone\b", re.S)
+CLK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def proc_ticks(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            st = f.read()
+        x = st[st.rindex(")") + 2:].split()
+        return int(x[11]) + int(x[12])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def proc_age(pid):
+    st, bt = proc_start(pid), boot_time()
+    return now() - (bt + st / CLK) if st is not None and bt else None
+
+
+def cpu_percent(pids, dt):
+    t0 = {p: proc_ticks(p) for p in pids}
+    time.sleep(dt)
+    out = {}
+    for p in pids:
+        t1 = proc_ticks(p)
+        out[p] = round((t1 - t0[p]) / CLK / dt * 100) if t1 is not None and t0[p] is not None and dt > 0 else None
+    return out
+
+
+def _unquote(s):
+    s = s.strip()
+    return s[1:-1] if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"" else s
+
+
+def parse_wait(cmd):
+    """A waiting loop in a command line -> {"remote", "kind" (until/while), "cond", "targets": [...]}, or None.
+    targets: {"what": file / grep / pgrep / tmux / pid / other, "arg", "pat", "neg"}."""
+    text = cmd.replace("'\"'\"'", "'")
+    m = LOOP_RE.search(text)
+    if not m or "sleep" not in m.group(3):
+        return None
+    head = text[:m.start()]
+    remote = None
+    r = list(re.finditer(r"(?:^|[\s;&|(])ssh\s", head))
+    if r:
+        toks = head[r[-1].end():].split()
+        i = 0
+        while i < len(toks) and toks[i].startswith("-"):
+            i += 2 if len(toks[i]) == 2 and toks[i][1] in "bcDEeFIiJLlmOopQRSWw" else 1
+        if i < len(toks):
+            remote = toks[i].strip("'\"")
+    vars_ = dict(re.findall(r"\b([A-Za-z_]\w*)=([^\s;'\"]+)", head))
+    cond = m.group(2)
+    for k, v in vars_.items():
+        cond = re.sub(r"\$\{?" + k + r"\b\}?", v, cond)
+    targets = []
+    for clause in re.split(r"\|\||&&", cond):
+        c = re.sub(r"\s*(?:\d|&)?>>?&?\s*\S+", "", clause).strip()      # drop redirections (>/dev/null, 2>&1)
+        neg = c.startswith("!")
+        c = c.lstrip("! ").strip()
+        t = None
+        if re.match(r"(\[|test)\s+-[efsd]\s", c):
+            t = {"what": "file", "arg": _unquote(re.sub(r"^(\[|test)\s+-[efsd]\s+", "", c).rstrip("] ").strip())}
+        elif c.startswith("ls "):
+            t = {"what": "file", "arg": _unquote(c.split()[-1])}
+        elif re.match(r"grep\s", c):
+            parts = shlex.split(c, posix=True) if c.count("'") % 2 == 0 and c.count('"') % 2 == 0 else c.split()
+            args_ = [a for a in parts[1:] if not a.startswith("-")]
+            if len(args_) >= 2:
+                t = {"what": "grep", "pat": args_[0], "arg": args_[-1]}
+        elif re.match(r"pgrep\s", c):
+            parts = shlex.split(c, posix=True) if c.count("'") % 2 == 0 and c.count('"') % 2 == 0 else c.split()
+            args_ = [a for a in parts[1:] if not a.startswith("-")]
+            if args_:
+                t = {"what": "pgrep", "pat": args_[-1], "full": "-f" in parts or any(a.startswith("-") and "f" in a for a in parts[1:])}
+        elif "tmux has-session" in c:
+            s = re.search(r"-t\s+=?(\S+)", c)
+            t = {"what": "tmux", "arg": s.group(1).lstrip("=") if s else "?"}
+        elif re.match(r"kill\s+-0\s+\d+", c):
+            t = {"what": "pid", "arg": c.split()[-1]}
+        if t is None:
+            t = {"what": "other", "arg": c[:60]}
+        t["neg"] = neg
+        targets.append(t)
+    to = re.search(r"\btimeout\s+(\d+[smhd]?)\s", head)
+    return {"remote": remote, "kind": m.group(1), "cond": cond.strip()[:200], "targets": targets,
+            "loop": text[m.start():m.end()], "timeout": to.group(1) if to else None}
+
+
+def wait_text(w):
+    """'等 box14 上：TRAIN_DONE 出现 / tmux gpu-v199 结束' -- what the loop waits for, in words."""
+    bits = []
+    for t in w["targets"]:
+        # until X: waits for X to become true; while X: waits for X to become false
+        want_true = (w["kind"] == "until") != t["neg"]
+        if t["what"] == "file":
+            bits.append(f"{os.path.basename(t['arg']) or t['arg']} {'出现' if want_true else '消失'}")
+        elif t["what"] == "grep":
+            bits.append(f"{os.path.basename(t['arg'])} 里出现「{t['pat'][:20]}」" if want_true else f"{os.path.basename(t['arg'])} 里「{t['pat'][:20]}」消失")
+        elif t["what"] == "pgrep":
+            bits.append(f"进程「{t['pat'][:30]}」{'起来' if want_true else '结束'}")
+        elif t["what"] == "tmux":
+            bits.append(f"tmux {t['arg']} {'起来' if want_true else '结束'}")
+        elif t["what"] == "pid":
+            bits.append(f"pid {t['arg']} {'在' if want_true else '结束'}")
+        else:
+            bits.append(f"条件 {t['arg']}")
+    return (f"等 {w['remote']} 上：" if w["remote"] else "等 ") + " / ".join(bits)
+
+
+def display_cmd(cmd):
+    """The command a Claude Code Bash call runs, without its shell-snapshot wrapper."""
+    m = re.search(r"&& eval '(.*?)' \\?< /dev/null", cmd, re.S)
+    return m.group(1).replace("'\"'\"'", "'") if m and "shell-snapshots" in cmd else cmd
+
+
+def chain_pids(pid, table):
+    """pid, its ancestors, and its descendants."""
+    out = set(tree_pids(pid, table))
+    p = pid
+    while p in table and p not in (0, 1):
+        out.add(p)
+        p = table[p][0]
+    return out
+
+
+def spin_reason(w, pid, age, table, cmdlines):
+    """Why a waiting loop looks like it will never end, or None (the 10-05 cases, made checkable)."""
+    for t in w["targets"]:
+        waits_for_end = (w["kind"] == "while") != t["neg"]
+        if t["what"] == "pgrep" and waits_for_end and t.get("full"):
+            try:
+                rx = re.compile(t["pat"])
+            except re.error:
+                continue
+            # the shell running the loop has the loop in its own command line: pgrep -f always finds it
+            if rx.search(w["loop"]):
+                cut = f"（外面有 timeout {w['timeout']}，到时会被掐断）" if w.get("timeout") else ""
+                return f"永远等不完：pgrep -f「{t['pat'][:30]}」会匹配到跑这个循环的 shell 自己{cut}"
+    if w["remote"]:
+        return None
+    files = [t for t in w["targets"] if t["what"] in ("file", "grep")]
+    if not files or age is None:
+        return None
+    start = now() - age
+    for t in files:
+        path = t["arg"]
+        if "/tasks/" in path and path.endswith(".output"):
+            try:
+                idle = now() - os.path.getmtime(path)
+            except OSError:
+                idle = None
+            if idle is not None and idle > AGENT_OUT_H * 3600:
+                return f"等的子 agent 可能早停了：{os.path.basename(path)} 已 {idle / 3600:.1f} h 没变"
+    if age < SPIN_H * 3600:
+        return None
+    for t in files:
+        # the target itself, or anything next to it (a DONE flag appears only at the end; the job's
+        # logs and checkpoints beside it show it is alive)
+        d = os.path.dirname(t["arg"].split("*")[0]) or "."
+        try:
+            near = [d] + [os.path.join(d, x) for x in os.listdir(d)[:500]]
+        except OSError:
+            near = []
+        if any(os.path.getmtime(x) >= start for x in near if os.path.exists(x)):
+            return None
+    return f"可能空转：等了 {age / 3600:.1f} h，等的文件和它所在目录从开始等到现在都没变过"
+
+
+def session_tasks(sample_s=None, show_all=False):
+    """Live sessions with their child processes, waiting loops and spin flags."""
+    if not os.path.isdir("/proc/self"):
+        return []
+    table = proc_table()
+    cmdlines = {p: proc_cmdline(p) for p in table}
+    reg = {}
+    adapters = load_adapters()
+    for ad in adapters:
+        try:
+            for e in ad.sessions():
+                if isinstance(e, dict) and isinstance(e.get("pid"), int):
+                    reg[e["pid"]] = (ad, e)
+        except Exception as ex:
+            eprint(f"dingo-pack: adapter {getattr(ad, 'name', '?')}: sessions() failed: {ex}")
+    # children that left the tree (nohup / setsid) still carry the agent's pid in an env var (CLAUDE_PID)
+    envs = sorted({ad.owner_env.encode() for ad in adapters if getattr(ad, "owner_env", None)})
+    owner = {}
+    for p in table:
+        if p in reg or not envs:
+            continue
+        env_ = proc_environ(p, tuple(envs))
+        for k in envs:
+            cp = env_.get(k.decode())
+            if cp and cp.isdigit() and int(cp) in reg and reg[int(cp)][0].owner_env == k.decode():
+                owner[p] = int(cp)
+    for cp in reg:
+        for p in tree_pids(cp, table):
+            if p != cp:
+                owner.setdefault(p, cp)
+    sample = float(os.environ.get("DINGO_SAMPLE_S", sample_s if sample_s is not None else 1.0))
+    tcache = read_json(_tok_cache_path(), {}) or {}
+    cpu = cpu_percent(list(owner), sample) if owner else {}
+    roster = (load_roster().get("sessions") or {})
+    out = []
+    day = time.strftime("%Y-%m-%d")
+    for cp, (ad, e) in reg.items():
+        sid = e.get("id")
+        name = e.get("name") or (roster.get(sid) or {}).get("name") or e.get("fallback_name") or str(cp)
+        kids, waits, seen = [], [], set()
+        for p in sorted(q for q, o in owner.items() if o == cp):
+            age = proc_age(p)
+            cmd = cmdlines.get(p, "")
+            w = parse_wait(cmd)
+            if w:
+                key = (w["remote"], w["cond"])
+                if key not in seen:
+                    seen.add(key)
+                    waits.append(dict(w, pid=p, age_s=age, text=wait_text(w), spin=spin_reason(w, p, age, table, cmdlines)))
+                continue
+            if not show_all and (age is None or age < CHILD_MIN_S):
+                continue
+            if re.match(r"(sleep|cat|tee|head|tail)\b|ssh -W ", cmd) or not cmd:
+                continue
+            kids.append({"pid": p, "cmd": display_cmd(cmd)[:80], "age_s": age, "cpu": cpu.get(p), "pss": proc_pss(p)})
+        try:
+            tok = adapter_usage(ad, sid, day, tcache) if sid else None
+        except Exception as ex:
+            eprint(f"dingo-pack: adapter {getattr(ad, 'name', '?')}: usage failed: {ex}")
+            tok = None
+        out.append({"name": name, "agent": getattr(ad, "name", "?"), "pid": cp, "sid": sid, "children": kids, "waits": waits, "tokens": tok,
+                    "ctx_long": bool(tok and (tok.get("last_input") or 0) > CTX_WARN)})
+    try:
+        write_atomic(_tok_cache_path(), json.dumps(tcache))
+    except OSError:
+        pass
+    return sorted(out, key=lambda s: (not any(w["spin"] for w in s["waits"]), not s["ctx_long"], s["name"]))
+
+
+# --- tokens: Claude Code transcripts carry message.usage on each assistant line (one message is often
+# written several times with the same id: count it once). Read incrementally; cache under the state dir.
+def _tok_cache_path():
+    return os.path.join(state_dir(), "tokens.json")
+
+
+def _local_day(ts):
+    import datetime as dt
+    try:
+        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return None
+
+
+def transcript_usage(path, cache):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    c = cache.get(path)
+    if not c or c.get("ino") != st.st_ino or c.get("off", 0) > st.st_size:
+        c = {"ino": st.st_ino, "off": 0, "days": {}, "last_input": None, "last_t": None, "ids": [], "day": None}
+    if c["off"] < st.st_size:
+        with open(path, "rb") as f:
+            f.seek(c["off"])
+            data = f.read()
+        end = data.rfind(b"\n") + 1
+        c["off"] += end
+        for line in data[:end].splitlines():
+            if b'"usage"' not in line or b'"assistant"' not in line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            m = e.get("message") or {}
+            u = m.get("usage")
+            if e.get("type") != "assistant" or not isinstance(u, dict):
+                continue
+            mid = m.get("id") or e.get("uuid")
+            if mid in c["ids"]:
+                continue
+            c["ids"] = (c["ids"] + [mid])[-30:]
+            day = _local_day(e.get("timestamp")) or c.get("day") or time.strftime("%Y-%m-%d", time.localtime(st.st_mtime))
+            c["day"] = day
+            v = [int(u.get("input_tokens") or 0), int(u.get("cache_creation_input_tokens") or 0),
+                 int(u.get("cache_read_input_tokens") or 0), int(u.get("output_tokens") or 0)]
+            d = c["days"].setdefault(day, [0, 0, 0, 0, 0])
+            for i in range(4):
+                d[i] += v[i]
+            d[4] += 1
+            c["last_input"] = v[0] + v[1] + v[2]
+            c["last_t"] = e.get("timestamp")
+    cache[path] = c
+    return c
+
+
+def session_tokens(sid, day=None, cache=None, adapter=None):
+    """{"day", "input", "cache_write", "cache_read", "output", "turns", "last_input", "sub"} or None (no transcript)."""
+    own = cache is None
+    cache = cache if cache is not None else (read_json(_tok_cache_path(), {}) or {})
+    t = adapter_usage(adapter or ClaudeCodeAdapter(), sid, day or time.strftime("%Y-%m-%d"), cache)
+    if own:
+        try:
+            write_atomic(_tok_cache_path(), json.dumps(cache))
+        except OSError:
+            pass
+    return t
+
+
+def fmt_tok(n):
+    if n is None:
+        return "读不到"
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k"
+
+
+def cmd_tokens(args):
+    import datetime as dt
+    day = args.day or time.strftime("%Y-%m-%d")
+    try:
+        t0 = time.mktime(dt.datetime.strptime(day, "%Y-%m-%d").timetuple())
+    except ValueError:
+        eprint("dingo-pack tokens: --day YYYY-MM-DD")
+        return EXIT_USAGE
+    cache = read_json(_tok_cache_path(), {}) or {}
+    roster = (load_roster().get("sessions") or {})
+    rows = []
+    for path in glob.glob(os.path.join(claude_home(), "projects", "*", "*.jsonl")):
+        try:
+            if os.path.getmtime(path) < t0:
+                continue
+        except OSError:
+            continue
+        sid = os.path.splitext(os.path.basename(path))[0]
+        t = session_tokens(sid, day, cache)
+        if t and (t["turns"] or t["sub"]):
+            rows.append(((roster.get(sid) or {}).get("name") or sid[:8], t))
+    for ad in load_adapters():               # other agents: their live sessions
+        if getattr(ad, "name", "") == "claude-code":
+            continue
+        try:
+            for e in ad.sessions():
+                t = adapter_usage(ad, e.get("id"), day, cache)
+                if t and (t["turns"] or t["sub"]):
+                    rows.append((f"{e.get('name') or e.get('id')} ({ad.name})", t))
+        except Exception as ex:
+            eprint(f"dingo-pack tokens: adapter {getattr(ad, 'name', '?')}: {ex}")
+    write_atomic(_tok_cache_path(), json.dumps(cache))
+    if args.json:
+        print(json.dumps([dict(t, name=n) for n, t in rows], ensure_ascii=False))
+        return EXIT_OK
+    rows.sort(key=lambda r: -(r[1]["input"] + r[1]["cache_write"] + r[1]["cache_read"] + r[1]["output"]))
+    print(f"dingo-pack tokens · {day} · {len(rows)} sessions (main transcript; sub-agents in their own column)")
+    print(f"  {'session':<28} {'input':>7} {'cache写':>8} {'cache读':>8} {'output':>7} {'turns':>6} {'子agent':>8} {'上一轮输入':>9}")
+    tot = [0] * 6
+    for n, t in rows:
+        v = [t["input"], t["cache_write"], t["cache_read"], t["output"], t["turns"], t["sub"]]
+        tot = [a + b for a, b in zip(tot, v)]
+        print(f"  {n[:28]:<28} {fmt_tok(v[0]):>7} {fmt_tok(v[1]):>8} {fmt_tok(v[2]):>8} {fmt_tok(v[3]):>7} {v[4]:>6} "
+              f"{fmt_tok(v[5]):>8} {fmt_tok(t['last_input']):>9}" + ("  ⚠️ 上下文偏长" if (t["last_input"] or 0) > CTX_WARN else ""))
+    print(f"  {'合计':<28} {fmt_tok(tot[0]):>7} {fmt_tok(tot[1]):>8} {fmt_tok(tot[2]):>8} {fmt_tok(tot[3]):>7} {tot[4]:>6} {fmt_tok(tot[5]):>8}")
+    return EXIT_OK
+
+
+def fmt_age(s):
+    if s is None:
+        return "?"
+    return f"{s / 3600:.1f}h" if s >= 3600 else f"{s / 60:.0f}m"
+
+
+def print_tasks(rows):
+    for s in rows:
+        t = s["tokens"]
+        flags = []
+        if any(w["spin"] for w in s["waits"]):
+            flags.append("🌀空转?")
+        if s["ctx_long"]:
+            flags.append("📜上下文偏长")
+        tok = (f"今天 {fmt_tok(t['input'] + t['cache_write'] + t['cache_read'] + t['output'])} · 上一轮输入 {fmt_tok(t['last_input'])}"
+               if t else "token 读不到")
+        print(f"  {s['name'][:30]:<30} {tok}  {' '.join(flags)}")
+        for k in s["children"]:
+            print(f"      ├ {k['pid']:>7} {fmt_age(k['age_s']):>5} cpu {str(k['cpu']) + '%' if k['cpu'] is not None else '?':>5} "
+                  f"{fmt_size(k['pss']):>6}  {k['cmd'][:70]}")
+        for w in s["waits"]:
+            print(f"      ⏳ {w['pid']:>7} {fmt_age(w['age_s']):>5}  {w['text'][:90]}")
+            if w["spin"]:
+                print(f"         🌀 {w['spin']}")
+
+
+def session_memory():
+    """[(name, claude_pid, pss of the session's whole tree, n processes)] for live sessions."""
+    table = proc_table()
+    out = []
+    for p in glob.glob(os.path.join(claude_home(), "sessions", "*.json")):
+        e = read_json(p)
+        if not isinstance(e, dict) or not pid_alive(e.get("pid"), e.get("procStart")):
+            continue
+        pid = int(e["pid"])
+        pids = tree_pids(pid, table)
+        name = e.get("name") if e.get("nameSource") == "user" else None
+        if not name:
+            name = ((load_roster().get("sessions") or {}).get(e.get("sessionId")) or {}).get("name") or e.get("name")
+        out.append((name or str(pid), pid, tree_rss(pid, table), len(pids)))
+    return sorted(out, key=lambda x: -x[2])
+
+
+def cmd_top(args):
+    while True:
+        rows = session_memory()
+        total, avail = meminfo()
+        table = proc_table()
+        inside = set()
+        for _, pid, _, _ in rows:
+            inside.update(tree_pids(pid, table))
+        others = sorted(((rss, p) for p, (_, rss) in table.items() if p not in inside), reverse=True)[:5]
+        g = ghost_summary()
+        out = [f"dingo-pack top · {time.strftime('%H:%M:%S')} · free {fmt_size(avail)} of {fmt_size(total)}"
+               f" · sessions {fmt_size(sum(r[2] for r in rows))} · ghosts {g.get('n', '?')} ({fmt_size(g.get('pss'))})"]
+        out.append(f"  {'session':<26} {'memory':>8} {'procs':>6}")
+        for name, pid, mem, n in rows:
+            out.append(f"  {name[:26]:<26} {fmt_size(mem):>8} {n:>6}")
+        out.append("  other big processes (RSS):")
+        for rss, p in others:
+            out.append(f"  {fmt_size(rss):>8}  {p:>7}  {proc_cmdline(p)[:60]}")
+        tasks = session_tasks(show_all=args.all)
+        if args.json:
+            print(json.dumps({"memory": rows, "tasks": tasks}, ensure_ascii=False, default=str))
+            return EXIT_OK
+        if args.watch:
+            sys.stdout.write("\033[2J\033[H")
+        print("\n".join(out), flush=True)
+        print("  sessions: children (> 60 s), what they wait for, tokens today:")
+        print_tasks(tasks)
+        sys.stdout.flush()
+        if not args.watch:
+            return EXIT_OK
+        time.sleep(args.watch)
+
+
+def cmd_overview(args):
+    r = save_roster(quiet=True) or load_roster()
+    info = status_info(args)
+    L = info["lanes"]
+    g = info["ghosts"]
+    alive = sorted((s for s in r["sessions"].values() if s.get("alive")), key=lambda s: s.get("name") or "")
+    print(DINGO.strip("\n"))
+    print(f"\nmemory  {fmt_size(info['avail'])} free of {fmt_size(info['total'])} · promised {fmt_size(info['promised'])}"
+          f" · reserve {fmt_size(info['reserve'])}")
+    print(f"cpu     {info['cpu']['used']} / {info['cpu']['total']} slots · load {info['load']} on {info['ncpu']} cores"
+          + ("  ⚠ overloaded" if info["overloaded"] else ""))
+    print(f"slots   heavy {L['heavy']['held']} / {L['heavy']['n']} · io {L['io']['held']} / {L['io']['n']}"
+          f" · {len(info['waiting'])} waiting · ghosts {g.get('n', '?')} ({fmt_size(g.get('pss'))})")
+    for h in info["holders"]:
+        print(f"  [{h['lane']}:{h['slot']}] {h.get('session', '?'):<20} {h.get('cmd', '')[:50]}")
+    print(f"\nsessions ({len(alive)} alive)")
+    for s in alive:
+        st, guessed = state_of(s)
+        mk = s.get("mark") or {}
+        extra = f" until {mk['until']}" if mk.get("until") else ""
+        print(f"  {s.get('name', '?')[:26]:<26} {st}{'?' if guessed else ''}{extra}")
+    lost = select(r, 24.0, False)
+    if lost:
+        print(f"\n{len(lost)} lost in the last 24 h: dingo-pack list")
+    print("\nmore: dingo-pack who · top · doctor · list · --help")
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------- main
+
+EVERYDAY = """everyday:
+  dingo-pack save           remember the open sessions (the hooks also do it)
+  dingo-pack close-all      remember them, close the idle ones that are waiting / done
+  dingo-pack restore        bring the last batch back in new terminal tabs
+everything else is advanced: dingo-pack (overview), run, who, doctor, ghosts, list, resume ..."""
 
 DINGO = r"""
         /|
@@ -1379,7 +4148,7 @@ DINGO = r"""
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="dingo-pack", description=DINGO + "\n" + __doc__.split("\n\n")[0],
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+                                epilog=EVERYDAY, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"dingo-pack {__version__}")
     sp = p.add_subparsers(dest="sub")
 
@@ -1392,7 +4161,10 @@ def main(argv=None):
     q = sp.add_parser("run", help="run a heavy command in a slot, under memory limits")
     common(q)
     q.add_argument("--heavy", action="store_true", required=False)
-    q.add_argument("--mem", type=parse_size, help="expected peak memory, e.g. 6G (default 2G)")
+    q.add_argument("--io", action="store_true", help="big reads / writes on a slow or network disk (own lane, 1 slot)")
+    q.add_argument("--threads", type=int, help="CPU threads this job may use (sets OMP_NUM_THREADS etc.; "
+                   "takes that many CPU slots; default 8 heavy, 1 io)")
+    q.add_argument("--mem", type=parse_size, help="expected peak memory, e.g. 6G (default 1G; configurable)")
     q.add_argument("--limit", type=parse_size, help="per-process limit (default 1.5 x --mem; 0 = none)")
     q.add_argument("--limit-kind", choices=("data", "as"), default="data")
     q.add_argument("--tree-limit", type=parse_size, help="limit on the whole process tree (default = --limit; 0 = none)")
@@ -1403,6 +4175,7 @@ def main(argv=None):
     q.add_argument("--heavy", action="store_true")
     q.add_argument("--mem", type=parse_size)
     q.add_argument("--for", dest="duration", type=parse_duration, default=45 * 60.0)
+    q.add_argument("--threads", type=int, help="CPU slots the leased work takes (default 2)")
     q.add_argument("--note", default="")
 
     q = sp.add_parser("release", help="release leases")
@@ -1411,6 +4184,81 @@ def main(argv=None):
 
     q = sp.add_parser("who", help="slot holders and the queue")
     q.add_argument("--slots", type=int)
+    q.add_argument("--json", action="store_true")
+
+    q = sp.add_parser("board", help="one line per session: state, box, expected finish, ask-now / stopped flags")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("--html", help="write a self-refreshing HTML page to this path")
+    q.add_argument("--watch", type=float, help="refresh every N seconds")
+    q.add_argument("--stale-h", type=float, default=3.0, help="flag a status line unchanged this many hours (default 3)")
+
+    q = sp.add_parser("name", help="next session name for a letter today (L-MMDD-what, then L2-, L3- ...)")
+    q.add_argument("letter")
+    q.add_argument("what", help="card number or short word, e.g. 0-196")
+    q.add_argument("--suffix", help="e.g. ds-yi for a session on another account")
+    q.add_argument("--date", help="MMDD (default today)")
+
+    q = sp.add_parser("card", help="card new: next free number, reserved here, with a skeleton")
+    q.add_argument("action", choices=("new",))
+    q.add_argument("title")
+    q.add_argument("--out", help="write the skeleton to this file")
+    q.add_argument("--registry", help="file that lists the numbers already used (read only)")
+    q.add_argument("--session")
+
+    q = sp.add_parser("lint", help="naming, one-per-letter, stale / overdue status lines, missing status")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("--stale-h", type=float, default=3.0)
+
+    q = sp.add_parser("queue", help="prompts waiting for a condition: add / list / show / sent")
+    q.add_argument("action", choices=("add", "list", "show", "sent"))
+    q.add_argument("id", nargs="?", type=int)
+    q.add_argument("--when", action="append", default=[], help="mark:NAME=done | file:PATH | at:HH:MM | alive:NAME | gone:NAME")
+    q.add_argument("--to", default="?")
+    q.add_argument("--prompt")
+    q.add_argument("--prompt-file")
+    q.add_argument("--clip", action="store_true", help="show: also copy to the Windows clipboard")
+    q.add_argument("--session")
+
+    q = sp.add_parser("claim", help="box occupancy file: list / check / add / wait / sweep / remove; done flags release lines, stale lines alert")
+    q.add_argument("action", choices=("list", "check", "add", "remove", "wait", "sweep"))
+    q.add_argument("--file")
+    q.add_argument("--who")
+    q.add_argument("--task")
+    q.add_argument("--cards")
+    q.add_argument("--until", help="expected end, e.g. '柏林 10-06 05:05'")
+    q.add_argument("--done", help="add: done flag (path or glob); once it exists the line is removed by the next claim command")
+    q.add_argument("--grace", type=int, default=CLAIM_GRACE_MIN, help="minutes past the expected end before a line counts as stale")
+    q.add_argument("--alert", help="append stale lines to this alert file (default: <claim dir>/runs/claim_stale_<box>.alert if runs/ exists)")
+    q.add_argument("--every", type=float, default=60, help="wait: seconds between checks")
+    q.add_argument("--timeout", help="wait: give up after this long (e.g. 8h); exit 75")
+    q.add_argument("--take-stale", action="store_true", help="check / wait / add: treat stale lines as free (only if your card says so)")
+    q.add_argument("--stop-on-stale", action="store_true", help="wait: exit 4 as soon as only stale lines are in the way")
+    q.add_argument("--json", action="store_true", help="list: machine-readable")
+    q.add_argument("--session")
+
+    q = sp.add_parser("boxes", help="one line per box over read-only ssh: up / no GPUs / unreachable, cards, claims, disk, watchdog; note / history")
+    q.add_argument("words", nargs="*", help="[box ...] | note BOX TEXT | history [BOX]")
+    q.add_argument("--boxes", help="boxes.json (default $DINGO_BOXES or ~/.config/dingo-pack/boxes.json)")
+    q.add_argument("--no-du", action="store_true", help="skip the per-directory sizes (du runs on the box, up to 90 s)")
+    q.add_argument("--ssh-timeout", type=int, default=150)
+    q.add_argument("--every", type=float, help="repeat every N seconds (only while this machine is on)")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("--session")
+
+    q = sp.add_parser("_probe", help="(internal) what `boxes` runs on a box; reads only")
+    q.add_argument("--data", default="/root/gpufree-data")
+    q.add_argument("--no-du", action="store_true")
+
+    q = sp.add_parser("top", help="task manager: memory, each session's children, what it waits for, spin flags, tokens")
+    q.add_argument("--watch", type=float, help="refresh every N seconds")
+    q.add_argument("--all", action="store_true", help="also children younger than 60 s")
+    q.add_argument("--json", action="store_true")
+    q = sp.add_parser("adapter", help="test agent adapters (DINGO_AGENTS) against this machine; see ADAPTERS.md")
+    q.add_argument("action", choices=("test",))
+    q.add_argument("--agents", help="comma-separated built-in names / adapter files (default $DINGO_AGENTS or claude-code)")
+    q = sp.add_parser("tokens", help="tokens per session for a day, from Claude Code's transcripts")
+    q.add_argument("--day", help="YYYY-MM-DD (default today)")
+    q.add_argument("--json", action="store_true")
     q = sp.add_parser("log", help="recent log lines")
     q.add_argument("-n", type=int, default=20)
 
@@ -1442,14 +4290,55 @@ def main(argv=None):
     q.add_argument("--yes", action="store_true", help="do not pause between batches")
     q.add_argument("--dry-run", action="store_true")
 
+    q = sp.add_parser("doctor", help="check memory, OOM kills, mounts, WSL settings, slots, roster, ghosts")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("--no-git", dest="git", action="store_false", help="skip wombat-gate doctor on live repos")
+
+    q = sp.add_parser("ghosts", help="process trees left behind by sessions that are gone")
+    q.add_argument("--reap", action="store_true", help="stop them (human only)")
+    q.add_argument("--yes", action="store_true")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("ids", nargs="*", help="#k of the groups to reap (default: all not kept)")
+
+    q = sp.add_parser("close-all", help="remember every session and close the safe ones (idle + waiting / done)")
+    q.add_argument("--dry-run", action="store_true")
+    q.add_argument("--sid", help=argparse.SUPPRESS)
+
+    q = sp.add_parser("restore", help="bring back the last batch (closed by close-all, or lost in a crash)")
+    q.add_argument("names", nargs="*")
+    q.add_argument("--all", action="store_true", help=argparse.SUPPRESS)
+    q.add_argument("--via", choices=("wt", "tmux", "print"))
+    q.add_argument("--batch", type=int)
+    q.add_argument("--prompt")
+    q.add_argument("--yes", action="store_true")
+    q.add_argument("--dry-run", action="store_true")
+
+    q = sp.add_parser("stow", help="(advanced) note the live sessions; with --close, close the idle waiting / done ones")
+    q.add_argument("--close", action="store_true")
+    q.add_argument("--dry-run", action="store_true")
+    q.add_argument("--sid", help=argparse.SUPPRESS)
+
+    q = sp.add_parser("unstow", help="reopen what the last stow closed")
+    q.add_argument("names", nargs="*")
+    q.add_argument("--all", action="store_true", help="also sessions stow left running (if they are gone now)")
+    q.add_argument("--via", choices=("wt", "tmux", "print"))
+    q.add_argument("--batch", type=int)
+    q.add_argument("--prompt")
+    q.add_argument("--yes", action="store_true")
+    q.add_argument("--dry-run", action="store_true")
+
     args = p.parse_args(argv)
-    if args.sub and not (args.sub == "save" and getattr(args, "hook", False)):
+    if args.sub and not (args.sub == "save" and getattr(args, "hook", False)) and args.sub not in ("_probe", "claim"):
         check_local_state()
     fn = {"run": cmd_run, "lease": cmd_lease, "release": cmd_release, "who": cmd_who, "log": cmd_log,
-          "save": cmd_save, "mark": cmd_mark, "list": cmd_list, "resume": cmd_resume}.get(args.sub)
+          "save": cmd_save, "mark": cmd_mark, "list": cmd_list, "resume": cmd_resume,
+          "doctor": cmd_doctor, "ghosts": cmd_ghosts, "stow": cmd_stow, "unstow": cmd_unstow,
+          "top": cmd_top, "close-all": cmd_close_all, "restore": cmd_restore, "board": cmd_board,
+          "name": cmd_name, "card": cmd_card, "lint": cmd_lint, "queue": cmd_queue, "claim": cmd_claim,
+          "boxes": cmd_boxes, "_probe": cmd_probe, "tokens": cmd_tokens,
+          "adapter": cmd_adapter}.get(args.sub)
     if not fn:
-        p.print_help()
-        return EXIT_USAGE
+        return cmd_overview(args)
     return fn(args)
 
 
