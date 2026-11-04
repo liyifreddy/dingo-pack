@@ -4327,7 +4327,16 @@ def main(argv=None):
     q.add_argument("--yes", action="store_true")
     q.add_argument("--dry-run", action="store_true")
 
-    args = p.parse_args(argv)
+    args, extra = p.parse_known_args(argv)
+    if extra:
+        # Python < 3.12 drops a positional that follows an option
+        # (`mark done --sid X finished` -> "unrecognized arguments: finished").
+        # Put those words back on the subcommand's tail positional.
+        tail = {"mark": "note", "ghosts": "ids", "release": "ids",
+                "resume": "names", "restore": "names", "unstow": "names"}.get(getattr(args, "sub", None))
+        if tail is None or not hasattr(args, tail):
+            p.error("unrecognized arguments: " + " ".join(extra))
+        setattr(args, tail, list(getattr(args, tail) or []) + extra)
     if args.sub and not (args.sub == "save" and getattr(args, "hook", False)) and args.sub not in ("_probe", "claim"):
         check_local_state()
     fn = {"run": cmd_run, "lease": cmd_lease, "release": cmd_release, "who": cmd_who, "log": cmd_log,

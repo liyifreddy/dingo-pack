@@ -5,12 +5,15 @@ permissions:
 jobs:
   posix:
     strategy:
+      # One broken cell must not cancel the others (the 3.8 cell hid 3.12 / macOS results).
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        python: ['3.8', '3.12']
         include:
-          - os: macos-latest
-            python: '3.12'
+          # ubuntu-latest is 26.04 now and setup-python has no 3.8 build for it;
+          # 3.8 is still built for 22.04.
+          - {os: ubuntu-22.04, python: '3.8'}
+          - {os: ubuntu-latest, python: '3.12'}
+          - {os: macos-latest, python: '3.12'}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

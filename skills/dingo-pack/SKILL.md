@@ -18,9 +18,13 @@ same moment, the machine runs out of memory and everybody's work dies with it.
 - Heavy work that is not a shell command (a code review, a verifier sub-agent, several
   sub-agents in parallel): `dingo-pack lease --mem <est> --for <duration> --note "<what>"`
   before, `dingo-pack release` after.
-- Before starting: `dingo-pack who` shows what is running and what is queued.
+- Big copies, archives or scans on a network / 9p drive: `dingo-pack run --io -- <command>`.
+- Before starting: `dingo-pack who` shows what is running and what is queued; the hint you
+  get before sub-agents says how many jobs to run in parallel. Follow it.
+- Something feels wrong (slow, I/O errors, out of memory): `dingo-pack doctor` and report
+  what it says.
 - Whenever you write a status line in your log, also report it:
-  `dingo-pack mark running "<step>"` (same as `midway`) ·
+  `dingo-pack mark running "<step>"` ·
   `dingo-pack mark waiting --until "<time>" "<what for>"` (`--until` is optional but lets `list`
   sort by when to resume) · `dingo-pack mark blocked "<who must decide>"` · `dingo-pack mark done`.
   After a crash this is how the person restarting the machine knows what to resume first.
@@ -30,3 +34,5 @@ same moment, the machine runs out of memory and everybody's work dies with it.
 - Don't start a model load, a full test suite or a large build without `dingo-pack run`.
 - Don't poll `dingo-pack who` in a loop; `run` waits for you.
 - Don't edit or delete files under `~/.local/state/dingo-pack/`.
+- Don't run `dingo-pack stow --close` or `ghosts --reap`: they stop other sessions' work
+  and are for the human. List with `ghosts` and report instead.

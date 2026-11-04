@@ -1389,8 +1389,18 @@ def t_queue(E):
 def _bt(dt_s, zone="Europe/Berlin", date=False):
     """A wall-clock time dt_s seconds from now in a zone (Berlin / box = Asia/Shanghai)."""
     import datetime as dt
-    from zoneinfo import ZoneInfo
-    d = dt.datetime.fromtimestamp(time.time() + dt_s, ZoneInfo(zone))
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(zone)
+    except Exception:                 # Python 3.8 has no zoneinfo: use the tool's fixed-zone fallback
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("dingo_pack_tz", TOOL)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        tz = mod._zone("柏林" if zone == "Europe/Berlin" else "box")
+    d = dt.datetime.fromtimestamp(time.time() + dt_s, tz)
     return d.strftime("%m-%d %H:%M" if date else "%H:%M")
 
 
