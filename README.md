@@ -5,24 +5,38 @@
        alt="Dingoes eating side by side at a trough with four compartments while three more wait their turn">
 </p>
 
-**Like a tab saver, for your Claude Code sessions.**
+**A pack of coding agents on one computer: heavy work takes a slot, gets in by memory, is watched while it runs; dingo knows who is running, and after a crash who was lost.**
 
 ```sh
-dingo-pack save          # remember the open sessions (the hooks also do it)
-dingo-pack close-all     # remember them, close the idle ones that are waiting / done
-dingo-pack restore       # bring the last batch back, one terminal tab each
+dingo-pack run --heavy --mem 4G -- pytest   # waits for a slot and free memory, runs under a cap
+dingo-pack watch --daemon                   # watches every process: alert, pause, resume, kill at the edge
+dingo-pack who                              # who runs what, room left, paused jobs, stalled sessions
+dingo-pack list                             # after a crash: which sessions were lost
+dingo-pack resume --midway --via print      # the command that continues each of them
 ```
 
 🌐 **English** · [中文](https://github.com/liyifreddy/dingo-pack/blob/main/README.zh-CN.md)
 
 The pack eats in order: dingoes share a kill without a scramble. dingo-pack is the pack
-leader for a dozen coding agents on one machine — it also hands out slots for heavy work
-and checks what is wrong when the machine struggles.
+leader for a dozen coding agents on one machine. Its five core jobs:
 
-`restore` opens a new Windows Terminal tab per session when it runs in WSL, a tmux window
-inside tmux, and otherwise prints the commands for you to paste. `close-all` only closes
-sessions that are idle and said they are waiting or done, and it is for humans: inside an
-agent it refuses.
+1. **Slots for heavy work** — tests, builds, training, exports wait their turn (`run --heavy`).
+2. **Admission by memory** — a job gets in when its declared peak fits what is free (minus what
+   running jobs were promised and a reserve); CPU slots = cores; nothing is a fixed count.
+3. **Watching while it runs** — `watch` sees every process of the user, also ones not started
+   through dingo: it alerts, pauses (SIGSTOP) the job that would take the machine down, resumes
+   it when there is room, kills only at the edge; it also reports a session whose status line
+   says 跑着 (running) and has not moved for 2 h.
+4. **Who is running** — `who` / the roster: sessions, their jobs, memory, status lines.
+5. **After a crash, who was lost** — the roster is saved as you work (`save` / `mark`); `list`
+   shows who was lost and `resume --via print` prints the command that continues each.
+   Two safety nets: dingo keeps the roster of every session on the machine, shepherd-dispatch
+   keeps the ones it started.
+
+Moving out (still working here, each says where it goes): `board`, `name`, `card`, `lint`,
+`queue` → shepherd-dispatch; `claim`, `boxes` → boobook-watch. No longer maintained (still
+working): `close-all`, `stow`, and opening terminal tabs (`resume` / `restore` / `unstow` with
+`--via wt|tmux`); `--via print` stays.
 
 ## 🚀 Quick start
 
@@ -65,8 +79,8 @@ python3 -m venv .venv-demo && .venv-demo/bin/python -m pip install .
 Expected from either: `dingo-pack 0.4.2`; the source demo also prints `hello`
 (admission may wait). State and locks must live on a local disk; leave `DINGO_HOME`
 at its default, outside a WSL mounted drive. `boxes`, `tokens`, adapter validation
-and task/wait columns are included; `watch`, `dispatch` and full three-table
-crosscheck remain design proposals. See [CHANGELOG](CHANGELOG.md) and
+and task/wait columns are included; `dispatch` and the full three-table crosscheck
+are not here (dispatch is shepherd-dispatch's job). See [CHANGELOG](CHANGELOG.md) and
 [release procedure](RELEASING.md).
 
 ## Platforms and agents
@@ -144,9 +158,10 @@ synthetic CSV under bounded memory without loading gigabytes into RAM.
   through dingo-pack, all four finish.
 - ✅ 🚚 **A lane for slow disks.** `run --io` gives big copies, archives and scans on a
   network or 9p drive their own queue (1 at a time), apart from CPU work.
-- ✅ 📋 **Roster: close-all, restore, recall.** Before you shut down, `close-all` notes every
-  session and closes the ones that are idle and waiting or done; `restore` brings them
-  back. After a crash `restore` works too: it brings back what the crash lost.
+- ✅ 📋 **Roster: who is running, who was lost.** Sessions are noted as they work (`save`,
+  `mark`); after a crash `list` shows who was lost and `resume --via print` prints the command
+  that continues each. (Closing in bulk with `close-all` / `stow` and opening tabs are no
+  longer maintained.)
 - ✅ 👻 **Ghosts and sub-agent hints.** `ghosts` finds processes whose session is gone.
   The hint hook tells an agent, before it starts sub-agents or heavy commands, how many
   slots are free, how much memory is left, and how many jobs it should run in parallel.
@@ -181,6 +196,61 @@ dingo-pack top                                            # memory by session
 - Work that isn't a shell command — an agent's own review, a batch of sub-agents — takes
   a lease: `dingo-pack lease --mem 3G --for 45m`, then `dingo-pack release`. The lease
   also ends when its agent exits.
+- **No fixed number of slots.** By default memory and CPU decide: a job goes in when its
+  `--mem` fits into available − promised to running jobs − reserve, else it queues; each job
+  takes `--threads` CPU slots (one per core). `who` says how many more fit right now and why.
+  Pin a number with `"slots": N` / `DINGO_SLOTS`; the reserve is `"reserve"` / `DINGO_RESERVE`
+  (default max(1 GB, 10 % of RAM)).
+- **Slow disks:** if the data can be copied to the local disk (`~/`, `/tmp`), copy it and work
+  there; otherwise use `run --io` for bulk reads and writes on `/mnt/...`.
+
+### Enforce it (Claude Code)
+
+With `DINGO_ENFORCE=1` (or `"hook": {"enforce": true}`) the hint hook refuses instead of
+hinting: a heavy-looking Bash command (pytest, `python run_all.py`, train / eval / export /
+regress scripts, make, MinerU, ...; `bash -c`, `timeout`, `nohup`, `uv run`, `conda run` are
+looked through, also `bash -lc` and `env … bash -c`) that is not under `dingo-pack run` is
+denied, and the reason carries the command rewritten. Bulk copies, archives, `find` without
+`-maxdepth`, and `grep -r` / `rg` over a big tree on a network / 9p mount are denied too;
+`rg` / `grep -r` on a file or a small directory pass, a single-file `cp` only gets the hint, and
+a `cd ~/x && …` first is taken into account. How much memory an inline `python -c` takes is not
+judged: that is up to `--mem`, the rules and `watch`. Sub-agents and review skills
+only get the hint. Any error in the hook lets the call through. Extend the rules under
+`"hook"`: `heavy_words`, `heavy_scripts` (regex), `light_scripts` (regex), `enforce_io`.
+
+### Keep watching while it runs: `watch`
+
+```sh
+dingo-pack watch --daemon          # background, single instance; dingo-pack watch stop
+dingo-pack watch status            # memory per session, what is paused, recent alerts
+dingo-pack watch resume 12345      # continue a paused job (or: all)
+dingo-pack session --name X --max 8G -- claude ...   # an agent session with a name and a cap
+```
+
+- Every 2 s it looks at all of this user's processes, **also those not started through
+  dingo-pack**, and groups them by session (`DINGO_SESSION` / `CLAUDE_PID` in the environment,
+  else the nearest agent ancestor: claude, codex, opencode, hermes).
+- Available memory below *warn* (default max(4 GB, 15 %)) or a process growing by 2 GB within
+  60 s → an alert (`watch/events.jsonl`, the dingo log, `who`). Below *stop* (max(2.5 GB, 8 %))
+  → it pauses (SIGSTOP) the fastest-growing job, else the biggest; nothing is lost, and it
+  resumes it (SIGCONT) once there is room (at most twice per job, counted across pauses and
+  watch restarts; after that it waits for `watch resume`). Every process is re-checked (start
+  time, owner) right before each signal, so a reused pid is never hit. Below *kill* (max(1.2 GB, 4 %)) → it kills the
+  biggest job and logs who, why, and the command to run it again. A session over its
+  `session --max` gets its biggest job paused (not resumed by itself).
+- Agent processes, shells, tmux and systemd are never touched; processes outside any session
+  only raise alerts unless `"watch": {"unowned": "stop"}`. Thresholds: `"watch": {"warn",
+  "stop", "kill", "interval", "grow_warn", ...}` or `DINGO_WATCH_WARN` etc. Cost here: ~0.5 % of
+  one core and 30 MB for 160 processes.
+- `session --max` uses a kernel cap (`systemd-run --user --scope -p MemoryMax=…`) where cgroup
+  v2 has the memory controller delegated to the user; on WSL2's default cgroup v1 that has no
+  effect, so `watch` enforces the cap.
+- Every 5 min it also reads each live session's status line (as `board` does): one that says
+  跑着 and has not changed for 2 h (`"watch": {"stall_h": 2}`) becomes an event and a `stalled:`
+  line in `who` / `board` with the session, how long and the log. 已交 / 已关 / 等 Yi are left alone.
+- `dingo-pack who --gate --need 4G` exits 1 when there is no room for a new session or a job is
+  still paused (for launch scripts). `watch resume` also works while no watch runs, and the
+  gate then lets the next one in.
 
 ## 📋 The roster
 
@@ -198,9 +268,10 @@ dingo-pack top                                            # memory by session
 ```sh
 dingo-pack mark running "step 3"           # say what you're doing: running | waiting | blocked | done
 dingo-pack mark waiting --until 18:30 "nightly job"
-dingo-pack close-all                    # before shutting down: note everyone, close the idle waiting / done ones
-dingo-pack restore                         # bring back what close-all closed
-dingo-pack resume NAME... --via tmux       # by name; tabs via Windows Terminal, tmux, or just print
+dingo-pack list                            # after a crash: who was lost
+dingo-pack resume NAME... --via print      # the command that continues each, to paste
+dingo-pack close-all                       # (no longer maintained) close the idle waiting / done ones
+dingo-pack restore                         # (opening tabs no longer maintained) bring back what close-all closed
 ```
 
 `close-all` never touches a session that is busy, running, blocked, or the one you
@@ -219,6 +290,9 @@ A process belongs to the session whose `CLAUDE_PID` it carries. Jobs left on pur
 
 ## 📊 Board
 
+> Moving to shepherd-dispatch (it still works here; so do `name`, `card`, `lint`, `queue`).
+> `claim` / `boxes` move to boobook-watch.
+
 ```sh
 dingo-pack board                  # one line per session: state, box, expected finish, flags
 dingo-pack board --html board.html --watch 30   # a page that refreshes itself
@@ -230,6 +304,8 @@ has passed; "may have stopped" means the status line has not changed for 3 hours
 anything else is left blank rather than guessed.
 
 ## 🧰 Team routines (optional)
+
+> Moving to shepherd-dispatch together with the board.
 
 `name` (next session name for a letter), `card new` (next free card number + skeleton),
 `lint` (naming, one session per letter, stale or overdue status lines), `queue` (prompts
@@ -244,8 +320,14 @@ and WSL memory tips are in the [reference](REFERENCE.md).
 
 ## ⚠️ Limits
 
-- The agent process itself can't be limited, only counted with a lease.
-- Only jobs started through dingo-pack are managed.
+- The agent process itself can't be limited, only counted with a lease; `watch` never pauses
+  or kills an agent process.
+- Slots and memory admission only cover jobs started through dingo-pack; everything else is
+  seen (and paused) only by `watch`, and only while it runs.
+- The enforcing hook is tested with Claude Code only; for Codex / OpenCode it is AGENTS.md
+  rules plus `watch`.
+- `watch` samples every 2 s: an allocation faster than that can still get through, and on
+  WSL2's cgroup v1 there is no kernel cap.
 - Slots are handed out roughly first come, first served (the kernel decides who wakes first).
 - macOS: the per-process limit isn't enforced (the tree limit is), and free memory is an
   estimate. `ghosts`, `top` and the WSL checks need Linux.

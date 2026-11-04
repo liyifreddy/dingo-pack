@@ -59,7 +59,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -463,7 +463,30 @@ def lane_size(lane, cfg, override=None):
         return int(override)
     if lane == "io":
         return int(os.environ.get("DINGO_IO_SLOTS") or cfg.get("io_slots", 1))
-    return int(cfg.get("slots", 6))
+    if cfg.get("slots"):
+        return int(cfg["slots"])                 # pinned by config / DINGO_SLOTS
+    # Not pinned: no fixed number. The ceiling is one job per CPU slot; what really decides is
+    # memory admission (declared --mem vs available - promised - reserve) and the CPU slots each
+    # job's --threads takes. A job that does not fit queues.
+    return cpu_total(cfg)
+
+
+def capacity(cfg, avail, reserve, prom, n, held, ct, cu, dm):
+    """How many more default-sized heavy jobs fit right now, and what decides it."""
+    by_mem = None if avail is None else max(0, int((avail - reserve - prom) // dm) if dm else n)
+    by_cpu = max(0, (ct - cu) // DEFAULT_THREADS["heavy"])
+    by_slots = max(0, n - held)
+    parts = {"memory": by_mem, "cpu": by_cpu, "slots": by_slots}
+    k = min(v for v in parts.values() if v is not None)
+    limiting = [name for name, v in parts.items() if v == k]
+    mem_txt = ("memory unknown" if avail is None else
+               f"memory ({fmt_size(avail)} available - {fmt_size(prom)} promised - {fmt_size(reserve)} reserve) "
+               f"/ {fmt_size(dm)} each = {by_mem}")
+    pinned = bool(cfg.get("slots"))
+    basis = (f"{mem_txt}; CPU {ct - cu} free / {DEFAULT_THREADS['heavy']} threads each = {by_cpu}; "
+             + (f"slots pinned at {n}: {by_slots} free" if pinned else f"no fixed slot count (ceiling = {n} CPU slots)"))
+    return {"n": k, "by_memory": by_mem, "by_cpu": by_cpu, "by_slots": by_slots, "slots_pinned": pinned,
+            "limiting": limiting, "basis": basis}
 
 
 class Slots:
@@ -1042,11 +1065,9 @@ def status_info(args=None):
     for ln in LANE_DIRS:
         n = lane_size(ln, cfg, getattr(args, "slots", None) if ln == "heavy" else None)
         lanes[ln] = {"held": sum(1 for _, h in hs if h["lane"] == ln), "n": n}
-    free_slots = max(0, lanes["heavy"]["n"] - lanes["heavy"]["held"])
-    room = (avail - reserve - prom) if avail is not None else None
-    k = free_slots if room is None else max(0, min(free_slots, int(room // dm) if dm else free_slots))
     ct, cu = cpu_total(cfg), cpu_used()
-    k = max(0, min(k, (ct - cu) // DEFAULT_THREADS["heavy"]))
+    cap = capacity(cfg, avail, reserve, prom, lanes["heavy"]["n"], lanes["heavy"]["held"], ct, cu, dm)
+    k = cap["n"]
     la, nc = loadavg(), n_cpus()
     waiting = []
     for p in glob.glob(os.path.join(sub_dir("waiting"), "*.json")):
@@ -1060,7 +1081,7 @@ def status_info(args=None):
     return {"lanes": lanes, "cpu": {"used": cu, "total": ct}, "load": la, "ncpu": nc,
             "overloaded": bool(la is not None and la > 1.5 * nc),
             "total": total, "avail": avail, "reserve": reserve, "promised": prom,
-            "default_mem": dm, "suggest_parallel": k, "holders": rows, "waiting": waiting,
+            "default_mem": dm, "suggest_parallel": k, "capacity": cap, "holders": rows, "waiting": waiting,
             "ghosts": ghost_summary()}
 
 
@@ -1094,6 +1115,20 @@ def cmd_who(args):
               f"for {w.get('phase')}  est {fmt_size(w.get('est'))}  {w.get('cmd', '')}")
     if not held and not waiting:
         print("  (nobody)")
+    cap = info["capacity"]
+    print(f"room now: {cap['n']} more heavy job(s) of {fmt_size(info['default_mem'])} / {DEFAULT_THREADS['heavy']} threads"
+          f" (limited by {', '.join(cap['limiting'])}) - {cap['basis']}. A job that declares more --mem than fits queues.")
+    for line in watch_summary_lines():
+        print(line)
+    if getattr(args, "gate", False):
+        need = args.need if args.need is not None else 4 * GIB
+        room = (avail or 0) - info["promised"] - reserve_bytes(cfg)
+        _, wst = watch_running()
+        paused = still_paused(wst)
+        ok = room >= need and not paused and info["lanes"]["heavy"]["held"] < info["lanes"]["heavy"]["n"]
+        print(f"gate: {'OK' if ok else 'WAIT'} - room {fmt_size(room)} after promised + reserve, need {fmt_size(need)}"
+              + (f", {len(paused)} job(s) paused by watch" if paused else ""))
+        return EXIT_OK if ok else 1
     return EXIT_OK
 
 
@@ -1158,14 +1193,20 @@ def status_line(cwd, name, pcfg, listing=None):
     rel = lg.replace("{date}", "*")
     d, base = os.path.split(os.path.join(cwd, rel))
     listing = {} if listing is None else listing
-    if d not in listing:
-        try:
-            listing[d] = os.listdir(d)
-        except OSError:
-            listing[d] = []
+    # the directory part may itself be a pattern (logs kept per team: "../hq-files/指挥台/*/日志/*_{name}.md")
+    dirs_key = ("dirs", d)
+    if dirs_key not in listing:
+        listing[dirs_key] = sorted(glob.glob(d)) if glob.has_magic(d) else [d]
     import fnmatch
     pat = base.replace("{name}", glob.escape(name))
-    files = [os.path.join(d, f) for f in listing[d] if fnmatch.fnmatchcase(f, pat)]
+    files = []
+    for dd in listing[dirs_key]:
+        if dd not in listing:
+            try:
+                listing[dd] = os.listdir(dd)
+            except OSError:
+                listing[dd] = []
+        files += [os.path.join(dd, f) for f in listing[dd] if fnmatch.fnmatchcase(f, pat)]
     if not files:
         return None, None
     path = max(files, key=lambda p: os.path.getmtime(p))
@@ -1641,6 +1682,7 @@ def reopen(rows, args, prompt_key, default_prompt):
         print("nothing to resume")
         return EXIT_OK
     via = "print" if args.dry_run else pick_via(args.via)
+    tabs_note(via)
     batch = max(1, int(args.batch or config().get("resume_batch", 4)))
     gap = float(os.environ.get("DINGO_RESUME_GAP_S", "5"))
     print(f"resuming {len(todo)} via {via}, {batch} at a time")
@@ -2367,9 +2409,50 @@ def stamp_ahead(line, seen):
     return int(ahead) if ahead > 10 else None
 
 
+STATUS_WORD_RE = re.compile(r"【\s*状态[^】]*】\s*([^\s·:：,，。;；|]+)")
+
+
+def status_word(line):
+    """The state word of a status line '【状态 柏林 HH:MM】跑着 · …' (跑着 / 等指挥 / 等 Yi / 已交 / 卡住 …), or None."""
+    m = STATUS_WORD_RE.search(line or "")
+    if not m:
+        return None
+    w = m.group(1)
+    if w == "等" and re.match(r"\s*Yi\b", (line or "")[m.end():]):
+        return "等 Yi"
+    return w
+
+
+def stalled_sessions(r, wc, t=None):
+    """Live sessions whose status line says one of wc['stall_words'] (default 跑着) and has not changed for
+    wc['stall_h'] hours: since the earlier of when dingo saw the line change and the line's own time."""
+    t = now() if t is None else t
+    out = []
+    for sid, s in (r.get("sessions") or {}).items():
+        line = s.get("status_line")
+        if not s.get("alive") or not line or status_word(line) not in wc["stall_words"]:
+            continue
+        changed = s.get("status_changed_at") or s.get("last_seen") or t
+        _, _, written = parse_status(line, changed)
+        since = min(changed, written) if written else changed
+        if t - since > wc["stall_h"] * 3600:
+            out.append({"sid": sid[:8], "name": s.get("name") or sid[:8], "since": since, "hours": round((t - since) / 3600, 1),
+                        "word": status_word(line), "log": s.get("log"), "line": line[:160]})
+    return sorted(out, key=lambda x: x["since"])
+
+
+def stall_text(x):
+    return (f"{x['name']}: status line '{x['word']}' unchanged for {x['hours']:g} h (since {hhmm(x['since'])})"
+            f" - log {x.get('log') or '?'}")
+
+
 def board_rows(r, stale_h):
     rows = []
     t = now()
+    try:
+        stalled = {x["sid"]: x for x in stalled_sessions(r, watch_config(), t)}
+    except Exception:                      # noqa: BLE001 - the board must still render
+        stalled = {}
     for s in sorted(r["sessions"].values(), key=lambda s: (not s.get("alive"), s.get("name") or "")):
         if not s.get("alive") and t - (s.get("last_seen") or 0) > 86400:
             continue
@@ -2382,6 +2465,8 @@ def board_rows(r, stale_h):
         if s.get("alive") and s.get("status_line") and s.get("status_changed_at") \
                 and t - s["status_changed_at"] > stale_h * 3600 and st != "done":
             flags.append("may have stopped")
+        if s["sid"][:8] in stalled:
+            flags.append(f"stalled {stalled[s['sid'][:8]]['hours']:g} h")      # 跑着 but the line has not moved
         ahead = stamp_ahead(s.get("status_line"), s.get("status_changed_at"))
         if s.get("alive") and ahead:
             flags.append(f"time {ahead} min ahead")         # the line's own time is later than when it was written
@@ -2453,6 +2538,16 @@ def cmd_board(args):
             if args.watch:
                 sys.stdout.write("\033[2J\033[H")
             print(f"dingo-pack board · {time.strftime('%H:%M')} · {sum(1 for b in rows if b['alive'])} alive")
+            try:
+                cap = status_info()["capacity"]
+                print(f"  room now: {cap['n']} more heavy job(s) - {cap['basis']}")
+            except Exception:              # noqa: BLE001 - the board must still render
+                pass
+            try:
+                for x in stalled_sessions(r, watch_config()):
+                    print("  stalled: " + stall_text(x))
+            except Exception:              # noqa: BLE001
+                pass
             print(f"  {'session':<24} {'state':<9} {'box':<6} {'expected':<11} {'flags':<20} status")
             for b in rows:
                 print(f"  {(b['name'] or '?')[:24]:<24} {b['state']:<9} {(b['box'] or ''):<6} "
@@ -4133,11 +4228,37 @@ def cmd_overview(args):
 
 # ---------------------------------------------------------------- main
 
-EVERYDAY = """everyday:
-  dingo-pack save           remember the open sessions (the hooks also do it)
-  dingo-pack close-all      remember them, close the idle ones that are waiting / done
-  dingo-pack restore        bring the last batch back in new terminal tabs
-everything else is advanced: dingo-pack (overview), run, who, doctor, ghosts, list, resume ..."""
+EVERYDAY = """core:
+  dingo-pack run --heavy --mem 4G -- CMD   heavy work: a slot, memory admission, caps
+  dingo-pack watch --daemon                watch it while it runs (pause / resume / kill at the edge)
+  dingo-pack who                           who runs what, room left, paused jobs, stalled sessions
+  dingo-pack save / mark / list            the roster; after a crash `list` shows who was lost
+  dingo-pack resume --via print            print the command that continues each lost session
+moving: board, name, card, lint, queue -> shepherd-dispatch; claim, boxes -> boobook-watch
+no longer maintained: close-all, stow, and opening terminal tabs (resume / restore / unstow --via wt|tmux)"""
+
+# 0.5 shrink (Yi 11-04 10:41 / 15:22): these still work, each says once where it is going.
+MOVED = {"board": "shepherd-dispatch", "name": "shepherd-dispatch", "card": "shepherd-dispatch",
+         "lint": "shepherd-dispatch", "queue": "shepherd-dispatch",
+         "claim": "boobook-watch", "boxes": "boobook-watch"}
+UNMAINTAINED = {"close-all": "closing sessions in bulk", "stow": "closing sessions in bulk"}
+
+
+def moved_note(sub):
+    """One line on stderr for a command that is moving or no longer maintained (DINGO_NO_MOVE_NOTE=1: silent)."""
+    if os.environ.get("DINGO_NO_MOVE_NOTE") == "1":
+        return
+    if sub in MOVED:
+        eprint(f"dingo-pack: note - `{sub}` is moving to {MOVED[sub]}; it still works here for now.")
+    elif sub in UNMAINTAINED:
+        eprint(f"dingo-pack: note - `{sub}` ({UNMAINTAINED[sub]}) is no longer maintained; it still works. "
+               "The roster stays: save / list / resume --via print.")
+
+
+def tabs_note(via):
+    if via in ("wt", "tmux") and os.environ.get("DINGO_NO_MOVE_NOTE") != "1":
+        eprint(f"dingo-pack: note - opening terminal tabs (--via {via}) is no longer maintained; it still works. "
+               "--via print (the commands to paste) stays.")
 
 DINGO = r"""
         /|
@@ -4145,6 +4266,749 @@ DINGO = r"""
     (      __)   dingo-pack: the pack eats in order
      |_|--|_|
 """
+
+# ---------------------------------------------------------------- watch: live memory guard, session caps
+# `run` only guards what it starts. `watch` looks at every process of this user while it runs: it
+# groups them by agent session (DINGO_SESSION / CLAUDE_PID in the environment, else the nearest agent
+# ancestor), warns when free memory falls or something grows fast, then pauses (SIGSTOP, resumable)
+# the biggest / fastest-growing job, and only near the edge kills the biggest one. Agent processes
+# themselves are never paused or killed.
+AGENT_COMMS = {"claude", "codex", "opencode", "opencode.exe", "hermes", "aider", "gemini", "goose"}
+WATCH_PROTECT = {"systemd", "init", "(sd-pam)", "sshd", "ssh", "login", "agetty", "dbus-daemon", "tmux: server",
+                 "tmux: client", "tmux", "screen", "bash", "sh", "zsh", "dash", "fish", "SessionLeader", "Relay",
+                 "wsl-pro-service", "dingo-pack"}
+WATCH_ENV_KEYS = (b"CLAUDE_PID", b"DINGO_SESSION", b"DINGO_SESSION_MAX", b"DINGO_SCOPE_TAG")
+
+
+def size_or_pct(v, total):
+    """'15%' of MemTotal, or a size like '4G'."""
+    s = str(v).strip()
+    if s.endswith("%"):
+        return int((total or 0) * float(s[:-1]) / 100)
+    return parse_size(s)
+
+
+def watch_config(cfg=None, total=None):
+    cfg = cfg if cfg is not None else config()
+    w = dict(cfg.get("watch") or {})
+    for k in ("warn", "stop", "kill", "interval", "min_target", "grow_warn", "grow_window", "unowned", "resume_hold",
+              "stall_h", "stall_every"):
+        e = os.environ.get("DINGO_WATCH_" + k.upper())
+        if e:
+            w[k] = e
+    total = total if total is not None else (meminfo()[0] or 0)
+    out = {
+        # warn / stop / kill: the larger of a size and a share of RAM (31 GB machine: 4.6 / 2.5 / 1.2 GB)
+        "warn": size_or_pct(w["warn"], total) if "warn" in w else max(4 * GIB, int(total * 0.15)),
+        "stop": size_or_pct(w["stop"], total) if "stop" in w else max(int(2.5 * GIB), int(total * 0.08)),
+        "kill": size_or_pct(w["kill"], total) if "kill" in w else max(int(1.2 * GIB), int(total * 0.04)),
+        "interval": float(w.get("interval", 2)),
+        "min_target": size_or_pct(w.get("min_target", "256M"), total),
+        "grow_warn": size_or_pct(w.get("grow_warn", "2G"), total),     # growth within grow_window -> alert
+        "grow_window": float(w.get("grow_window", 60)),
+        "unowned": str(w.get("unowned", "alert")),                     # alert | stop: processes outside any agent session
+        "auto_resume": bool(w.get("auto_resume", True)),
+        "protect": WATCH_PROTECT | set(w.get("protect") or []),
+        "cooldown": float(w.get("cooldown", 5)),
+        "resume_hold": float(w.get("resume_hold", 20)),               # seconds paused before an automatic resume
+        "max_auto_resumes": int(w.get("max_auto_resumes", 2)),        # per process, over all its pause cycles
+        # status lines: a live session whose line says one of stall_words and has not changed for stall_h
+        # hours is reported; checked every stall_every seconds (0 = off; off by default in scoped tests)
+        "stall_h": float(w.get("stall_h", 2)),
+        "stall_every": float(w.get("stall_every", 0 if os.environ.get("DINGO_SCOPE_TAG") else 300)),
+        "stall_words": list(w.get("stall_words") or ["跑着"]),
+        "alert_every": float(w.get("alert_every", 120)),
+    }
+    return out
+
+
+def watch_dir():
+    return sub_dir("watch")
+
+
+def proc_info(pid):
+    """(comm, state, uid) of a process, or None."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            st = f.read()
+        comm = st[st.index("(") + 1:st.rindex(")")]
+        state = st[st.rindex(")") + 2:].split()[0]
+        return comm, state, os.stat(f"/proc/{pid}").st_uid
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+PIDFD = hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")   # Python 3.9+ on Linux 5.3+
+
+
+def member(pid, start=None, uid=None):
+    """What a pause record keeps about one process: enough to tell later whether a pid is still it."""
+    return {"pid": int(pid), "start": proc_start(pid) if start is None else start,
+            "uid": os.getuid() if uid is None else uid}
+
+
+def same_process(m, protect=()):
+    """True if pid m["pid"] is still the process recorded in m: same start time, same owner, not
+    (now) a protected or agent process, not exited. A record without a start time never matches."""
+    pid, start = int(m.get("pid") or 0), m.get("start")
+    if not pid or start in (None, ""):
+        return False
+    cur = proc_start(pid)
+    if cur is None or str(cur) != str(start):
+        return False
+    info = proc_info(pid)
+    if not info or info[1] in ("Z", "X") or info[2] != m.get("uid", os.getuid()):
+        return False
+    return info[0] not in protect and info[0] not in AGENT_COMMS
+
+
+def signal_member(m, sig, protect=()):
+    """Send `sig` to one recorded process, re-checking its identity right before. With pidfd the
+    check and the signal refer to the same process even if the pid is reused in between."""
+    pid, fd = int(m.get("pid") or 0), None
+    if not pid:
+        return False
+    try:
+        if PIDFD:
+            try:
+                fd = os.pidfd_open(pid)
+            except OSError as e:
+                if e.errno == errno.ESRCH:
+                    return False
+                fd = None                                  # e.g. old kernel: fall back to kill()
+        if not same_process(m, protect):
+            return False
+        if fd is not None:
+            signal.pidfd_send_signal(fd, sig)
+        else:
+            os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def record_members(r):
+    """Members of a pause record. Older records (no `members`) keep only the root's start time: their
+    other pids count only if they are, right now, in the tree under that root (checked by the caller
+    first). A paused root cannot fork, so a descendant of it is not a stranger that got a reused pid."""
+    if r.get("members"):
+        return [dict(m) for m in r["members"]]
+    if not r.get("pid"):
+        return []
+    root = {"pid": int(r["pid"]), "start": r.get("start"), "uid": os.getuid()}
+    if not same_process(root):
+        return [root]
+    table = proc_table()
+    under = set(tree_pids(int(r["pid"]), table))
+    return [root] + [member(q) for q in (r.get("pids") or []) if int(q) != root["pid"] and int(q) in under]
+
+
+def signal_record(r, sig, protect=()):
+    """Signal what a pause record holds, process by process, each identity re-checked. If the root is
+    no longer the recorded process the whole record is stale: nothing is signalled, returns None.
+    Else the list of pids actually signalled."""
+    ms = record_members(r)
+    root = next((m for m in ms if int(m["pid"]) == int(r["pid"])), None)
+    if root is None or not same_process(root, protect):
+        return None
+    return [m["pid"] for m in ms if signal_member(m, sig, protect)]
+
+
+def watch_control_lock():
+    """Short-lived lock for the resume mailbox and status.json (not the watch's lifetime lock)."""
+    lk = open(os.path.join(watch_dir(), "control.lock"), "a+")
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    return lk
+
+
+def take_resume_requests(w, locked=False):
+    """Under the control lock: drop the records a `watch resume` asked for and empty the mailbox.
+    Requests that arrive later wait for the lock and stay in the mailbox for the next scan."""
+    if not locked:
+        with watch_control_lock():
+            return take_resume_requests(w, locked=True)
+    note = os.path.join(watch_dir(), "resumed.json")
+    for pid in read_json(note, []) or []:
+        try:
+            w.stopped.pop(int(pid), None)
+        except (TypeError, ValueError):
+            pass
+    if os.path.exists(note):
+        try:
+            os.unlink(note)
+        except OSError:
+            pass
+
+
+def claude_session_name(cpid, cache):
+    if cpid in cache:
+        return cache[cpid]
+    e = read_json(os.path.join(claude_home(), "sessions", f"{cpid}.json"), {}) or {}
+    name = (e.get("name") if e.get("name") else None) or (e.get("sessionId") or "")[:8] or f"claude pid {cpid}"
+    cache[cpid] = name
+    return name
+
+
+class Watcher:
+    """One scan = one call to step(). Keeps per-process history between scans."""
+
+    def __init__(self, wc, dry_run=False, out=None):
+        self.wc, self.dry, self.out = wc, dry_run, out
+        self.me, self.uid = os.getpid(), os.getuid()
+        self.scope = os.environ.get("DINGO_SCOPE_TAG")
+        self.attr = {}            # (pid, start) -> (session, session_max, is_agent, tag)
+        self.names = {}
+        self.hist = {}            # pid -> [(t, rss)]
+        self.stopped = {}         # pid -> record
+        self.last_action = 0.0
+        self.alerted = {}         # key -> t
+        self.events = []
+        self.level = "ok"
+        self.resumes = {}         # "pid:start" -> automatic resumes so far; survives pause cycles and restarts
+        old = read_json(os.path.join(watch_dir(), "status.json"), {}) or {}
+        for r in old.get("stopped") or []:   # a restarted watch keeps track of what it paused
+            if pid_alive(r.get("pid"), r.get("start")) and (proc_info(r["pid"]) or ("", ""))[1] == "T":
+                self.stopped[int(r["pid"])] = r
+        for k, n in (old.get("auto_resumes") or {}).items():
+            pid, _, start = str(k).partition(":")
+            if pid.isdigit() and start and pid_alive(int(pid), start):
+                self.resumes[k] = int(n)
+
+    def check_stalls(self, r):
+        """Report stalled status lines in a roster: an event once per line, again every stall_h hours."""
+        t, found = now(), []
+        seen = getattr(self, "stall_seen", None)
+        if seen is None:
+            seen = self.stall_seen = {}
+        for x in stalled_sessions(r, self.wc, t):
+            found.append(x)
+            key = (x["sid"], x["line"])
+            if t - seen.get(key, 0) >= max(self.wc["stall_h"] * 3600, 60):
+                seen[key] = t
+                self.event("status-stalled", session=x["name"], log=x.get("log"), hours=x["hours"],
+                           msg=stall_text(x) + ". Ask it, or look at the log.")
+        self.stalled = found
+        return found
+
+    def stall_scan(self, force=False):
+        """Every stall_every s: refresh the roster the way `board` does (status lines from the session
+        logs) and check it. Bounded: a log on a hung network mount cannot stop the guard."""
+        every = self.wc["stall_every"]
+        if not every and not force:
+            return None
+        t = now()
+        if not force and t - getattr(self, "stall_t", 0) < every:
+            return None
+        self.stall_t = t
+        st, r = run_timed(lambda: save_roster(quiet=True) or load_roster(), 30)
+        if st != "ok" or not r:
+            return None
+        return self.check_stalls(r)
+
+    @staticmethod
+    def ident(pid, start):
+        return f"{int(pid)}:{start}"
+
+    # -- attribution
+    def attribute(self, pid, table, start=None):
+        start = proc_start(pid) if start is None else start
+        key = (pid, start)
+        if key in self.attr:
+            return self.attr[key]
+        info = proc_info(pid)
+        env = proc_environ(pid, WATCH_ENV_KEYS)
+        is_agent = bool(info and info[0] in AGENT_COMMS)
+        sess, smax = env.get("DINGO_SESSION"), env.get("DINGO_SESSION_MAX")
+        if not sess and env.get("CLAUDE_PID", "").isdigit():
+            sess = claude_session_name(int(env["CLAUDE_PID"]), self.names)
+        if not sess and is_agent and info[0] == "claude":
+            sess = claude_session_name(pid, self.names)
+        if not sess:                                   # codex / opencode / hermes children: nearest agent ancestor
+            p, seen = table.get(pid, (0, 0))[0], 0
+            while p and p in table and seen < 64:
+                pi = proc_info(p)
+                if pi and pi[0] in AGENT_COMMS:
+                    pe = proc_environ(p, WATCH_ENV_KEYS)
+                    sess = pe.get("DINGO_SESSION") or (claude_session_name(p, self.names) if pi[0] == "claude"
+                                                       else f"{pi[0]} pid {p}")
+                    smax = smax or pe.get("DINGO_SESSION_MAX")
+                    break
+                p, seen = table[p][0], seen + 1
+        if not sess and is_agent:
+            sess = f"{info[0]} pid {pid}"
+        val = (sess, int(smax) if smax and smax.isdigit() else None, is_agent, env.get("DINGO_SCOPE_TAG"))
+        self.attr[key] = val
+        return val
+
+    def event(self, kind, **kw):
+        rec = dict({"t": now(), "kind": kind}, **kw)
+        self.events.append(rec)
+        self.events = self.events[-30:]
+        try:
+            with open(os.path.join(watch_dir(), "events.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        write_log(dict(rec, op="watch"))
+        if self.out:
+            what = kw.get("session") or ""
+            print(f"[{hhmm(rec['t'])}] watch {kind}: {kw.get('msg', '')}" + (f"  ({what})" if what else ""),
+                  file=self.out, flush=True)
+
+    def alert(self, key, kind, **kw):
+        if now() - self.alerted.get(key, 0) < self.wc["alert_every"]:
+            return
+        self.alerted[key] = now()
+        self.event(kind, **kw)
+
+    # -- one scan
+    def step(self):
+        wc, t = self.wc, now()
+        total, avail = meminfo()
+        table = proc_table()
+        ancestors, p = set(), self.me
+        while p and p in table and p not in ancestors:
+            ancestors.add(p)
+            p = table[p][0]
+        procs = {}
+        for pid, (ppid, rss) in table.items():
+            if pid in ancestors:
+                continue
+            info = proc_info(pid)
+            if not info or info[2] != self.uid:
+                continue
+            start = proc_start(pid)
+            sess, smax, is_agent, tag = self.attribute(pid, table, start)
+            if self.scope and tag != self.scope:
+                continue                     # scoped (self-test): never look at real processes
+            procs[pid] = {"pid": pid, "ppid": ppid, "rss": rss, "comm": info[0], "state": info[1],
+                          "session": sess, "smax": smax, "agent": is_agent, "start": start, "uid": info[2]}
+            h = self.hist.setdefault(pid, [])
+            h.append((t, rss))
+            while h and t - h[0][0] > wc["grow_window"]:
+                h.pop(0)
+        for pid in list(self.hist):
+            if pid not in procs:
+                del self.hist[pid]
+        for pid in list(self.stopped):
+            r = self.stopped[pid]
+            if pid not in procs or (r.get("start") not in (None, "") and str(procs[pid]["start"]) != str(r["start"])):
+                self.stopped.pop(pid)
+                self.event("gone", pid=pid, session=r.get("session"), msg=f"paused pid {pid} is gone ({r.get('cmd', '')[:60]})")
+        alive = {self.ident(pid, pr["start"]) for pid, pr in procs.items()}
+        for k in list(self.resumes):
+            if k not in alive:
+                del self.resumes[k]           # that process is gone (or its pid now names another): count starts over
+
+        def growth(pid):
+            h = self.hist.get(pid) or []
+            return h[-1][1] - min(x[1] for x in h) if len(h) > 1 else 0
+
+        def tree(pid):
+            return [q for q in tree_pids(pid, table) if q in procs and not procs[q]["agent"]
+                    and procs[q]["comm"] not in wc["protect"]] or [pid]
+
+        def tree_mem(pid):
+            return sum(procs[q]["rss"] for q in tree(pid) if q in procs)
+
+        def target_ok(pr, allow_stopped=False):
+            if pr["agent"] or pr["comm"] in wc["protect"] or pr["rss"] < wc["min_target"]:
+                return False
+            if pr["session"] is None and wc["unowned"] != "stop":
+                return False
+            return allow_stopped or pr["pid"] not in self.stopped
+
+        # sessions
+        sessions = {}
+        for pr in procs.values():
+            s = sessions.setdefault(pr["session"] or "(no session)", {"rss": 0, "n": 0, "max": None, "top": None})
+            s["rss"] += pr["rss"]
+            s["n"] += 1
+            s["max"] = s["max"] or pr["smax"]
+            if not pr["agent"] and (s["top"] is None or pr["rss"] > procs[s["top"]]["rss"]):
+                s["top"] = pr["pid"]
+
+        def who_line(n=3):
+            top = sorted(sessions.items(), key=lambda kv: -kv[1]["rss"])[:n]
+            return ", ".join(f"{k} {fmt_size(v['rss'])}" for k, v in top)
+
+        # 1. alerts
+        level = "ok"
+        if avail is not None and avail < wc["warn"]:
+            level = "warn"
+            self.alert("low", "low-memory", avail=avail, msg=f"available {fmt_size(avail)} < warn {fmt_size(wc['warn'])}; "
+                       f"biggest: {who_line()}")
+        for pr in procs.values():
+            g = growth(pr["pid"])
+            if g > wc["grow_warn"] and not pr["agent"]:
+                self.alert(("grow", pr["pid"]), "fast-growth", pid=pr["pid"], session=pr["session"], rss=pr["rss"],
+                           msg=f"pid {pr['pid']} ({pr['comm']}) grew {fmt_size(g)} in {wc['grow_window']:.0f} s, now "
+                               f"{fmt_size(pr['rss'])}: {proc_cmdline(pr['pid'])[:80]}")
+            if pr["session"] is None and not pr["agent"] and total and pr["rss"] > total * 0.25:
+                self.alert(("big", pr["pid"]), "big-unowned", pid=pr["pid"], rss=pr["rss"],
+                           msg=f"pid {pr['pid']} ({pr['comm']}) uses {fmt_size(pr['rss'])} and belongs to no agent session")
+        for name, s in sessions.items():
+            if s["max"] and s["rss"] > s["max"]:
+                self.alert(("smax", name), "session-over", session=name, rss=s["rss"],
+                           msg=f"session uses {fmt_size(s['rss'])} > its cap {fmt_size(s['max'])}")
+
+        # 2. pause / kill
+        acted = False
+        if t - self.last_action >= wc["cooldown"]:
+            if avail is not None and avail < wc["kill"]:
+                level = "kill"
+                cands = [pr for pr in procs.values() if target_ok(pr, allow_stopped=True)]
+                if cands:
+                    v = max(cands, key=lambda pr: tree_mem(pr["pid"]))
+                    self.kill(v, tree(v["pid"]), avail, procs)
+                    acted = True
+            elif avail is not None and avail < wc["stop"]:
+                level = "stop"
+                cands = [pr for pr in procs.values() if target_ok(pr)]
+                if cands:
+                    fast = [pr for pr in cands if growth(pr["pid"]) > 128 * MIB]
+                    v = max(fast or cands, key=lambda pr: (growth(pr["pid"]) if fast else tree_mem(pr["pid"])))
+                    self.pause(v, tree(v["pid"]), "machine", f"available {fmt_size(avail)} < stop {fmt_size(wc['stop'])}",
+                               procs)
+                    acted = True
+            if not acted:
+                for name, s in sessions.items():
+                    if s["max"] and s["rss"] > s["max"]:
+                        cands = [pr for pr in procs.values() if pr["session"] == name and target_ok(pr)]
+                        if cands:
+                            v = max(cands, key=lambda pr: tree_mem(pr["pid"]))
+                            self.pause(v, tree(v["pid"]), "session",
+                                       f"session {name} uses {fmt_size(s['rss'])} > its cap {fmt_size(s['max'])}", procs)
+                            acted = True
+                            break
+        if acted:
+            self.last_action = t
+        # 3. resume what was paused for the machine once there is room again
+        elif wc["auto_resume"] and avail is not None and level == "ok":
+            for pid, r in sorted(self.stopped.items(), key=lambda kv: kv[1]["t"]):
+                if r["why"] != "machine" or t - r["t"] < wc["resume_hold"] or \
+                        self.resumes.get(self.ident(pid, r.get("start")), 0) >= wc["max_auto_resumes"]:
+                    continue
+                if avail > wc["warn"] + max(GIB, r["rss"] // 2):      # room for it to grow by half again
+                    self.resume(pid, "room again: available " + fmt_size(avail))
+                    self.last_action = t
+                    break
+        self.level = level
+        top = sorted(sessions.items(), key=lambda kv: -kv[1]["rss"])[:12]
+        status = {"t": t, "pid": self.me, "interval": wc["interval"], "dry_run": self.dry, "level": level,
+                  "total": total, "avail": avail, "thresholds": {k: wc[k] for k in ("warn", "stop", "kill")},
+                  "sessions": [{"session": k, "rss": v["rss"], "procs": v["n"], "max": v["max"],
+                                "top_pid": v["top"], "top_cmd": proc_cmdline(v["top"])[:80] if v["top"] else ""}
+                               for k, v in top],
+                  "stopped": [], "auto_resumes": dict(self.resumes), "stalled": list(getattr(self, "stalled", [])), "events": self.events[-10:], "nprocs": len(procs)}
+        try:
+            with watch_control_lock():
+                take_resume_requests(self, locked=True)   # a `watch resume` during the scan is honoured, not overwritten
+                status["stopped"] = list(self.stopped.values())
+                write_atomic(os.path.join(watch_dir(), "status.json"), json.dumps(status, ensure_ascii=False, default=str))
+        except OSError:
+            pass
+        return status
+
+    def members(self, pids, procs):
+        """Pause-record members, with the start time and owner seen in this scan (not re-read later)."""
+        return [member(q, procs[q]["start"], procs[q]["uid"]) if q in procs and procs[q].get("start") is not None
+                else member(q) for q in pids]
+
+    def signal_tree(self, rec, sig):
+        """Signal a record's processes, each re-checked: a pid that now names another process (reused,
+        other owner, protected) is skipped. None = the root itself changed: nothing signalled."""
+        return signal_record(rec, sig, self.wc["protect"])
+
+    def pause(self, pr, pids, why, reason, procs=None):
+        cmd = proc_cmdline(pr["pid"])
+        try:
+            cwd = os.readlink(f"/proc/{pr['pid']}/cwd")
+        except OSError:
+            cwd = ""
+        procs = procs or {}
+        ms = self.members(pids, procs)
+        root = next(m for m in ms if m["pid"] == pr["pid"]) if any(m["pid"] == pr["pid"] for m in ms) else member(pr["pid"])
+        key = self.ident(pr["pid"], root["start"])
+        rec = {"pid": pr["pid"], "start": root["start"], "pids": pids, "members": ms, "session": pr["session"],
+               "rss": sum(proc_table().get(q, (0, 0))[1] for q in pids), "cmd": cmd[:200], "cwd": cwd,
+               "why": why, "reason": reason, "t": now(), "resumes": self.resumes.get(key, 0), "dry_run": self.dry}
+        if not self.dry:
+            got = self.signal_tree(rec, signal.SIGSTOP)
+            if got is None:                     # the root changed between scan and signal: do not record a pause
+                self.event("skipped", pid=pr["pid"], session=pr["session"],
+                           msg=f"pid {pr['pid']} is no longer the process seen in the scan; nothing paused")
+                return
+            rec["pids"] = got
+            rec["members"] = [m for m in ms if m["pid"] in got]
+            pids = got
+        self.stopped[pr["pid"]] = rec
+        self.event("paused" if not self.dry else "would-pause", pid=pr["pid"], session=pr["session"], rss=rec["rss"],
+                   msg=f"{'paused' if not self.dry else 'would pause'} pid {pr['pid']} ({len(pids)} proc, {fmt_size(rec['rss'])}) "
+                       f"- {reason}. Nothing is lost: it continues with `dingo-pack watch resume {pr['pid']}` "
+                       f"(or kill -CONT {' '.join(map(str, pids))}). {cmd[:80]}")
+
+    def resume(self, pid, reason):
+        """Automatic resume (counted against max_auto_resumes for this process)."""
+        r = self.stopped.pop(pid, None)
+        if not r:
+            return False
+        if not self.dry and self.signal_tree(r, signal.SIGCONT) is None:
+            self.event("gone", pid=pid, session=r.get("session"),
+                       msg=f"paused pid {pid} is no longer the same process; record dropped, nothing signalled")
+            return False
+        key = self.ident(pid, r.get("start"))
+        self.resumes[key] = self.resumes.get(key, 0) + 1
+        self.event("resumed", pid=pid, session=r.get("session"),
+                   msg=f"resumed pid {pid} - {reason} (automatic resume {self.resumes[key]} of {self.wc['max_auto_resumes']})")
+        return True
+
+    def kill(self, pr, pids, avail, procs):
+        cmd = proc_cmdline(pr["pid"])
+        try:
+            cwd = os.readlink(f"/proc/{pr['pid']}/cwd")
+        except OSError:
+            cwd = ""
+        mem = sum(procs[q]["rss"] for q in pids if q in procs)
+        if not self.dry:
+            ms = self.members(pids, procs)
+            root = next((m for m in ms if m["pid"] == pr["pid"]), member(pr["pid"]))
+            got = self.signal_tree({"pid": pr["pid"], "start": root["start"], "members": ms}, signal.SIGKILL)
+            if got is None:
+                self.event("skipped", pid=pr["pid"], session=pr["session"],
+                           msg=f"pid {pr['pid']} is no longer the process seen in the scan; nothing killed")
+                return
+            pids = got
+        self.stopped.pop(pr["pid"], None)
+        est = max(GIB, int(mem * 1.3))
+        self.event("killed" if not self.dry else "would-kill", pid=pr["pid"], session=pr["session"], rss=mem, cwd=cwd, cmd=cmd[:200],
+                   msg=f"{'killed' if not self.dry else 'would kill'} pid {pr['pid']} ({len(pids)} proc, {fmt_size(mem)}), the biggest job: "
+                       f"available {fmt_size(avail)} < kill {fmt_size(self.wc['kill'])}. To run it again, in {cwd or 'its directory'}: "
+                       f"dingo-pack run --heavy --mem {fmt_size(est)} -- {cmd[:120]}")
+
+
+def watch_running():
+    """(pid, status) of a live watch, else (None, last status)."""
+    wd = os.path.join(state_dir(), "watch")          # look only: do not create it
+    st = read_json(os.path.join(wd, "status.json"), {}) or {}
+    pid = st.get("pid")
+    try:
+        with open(os.path.join(wd, "lock")) as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_UN)
+            return None, st                  # nobody holds the lock: not running
+    except BlockingIOError:
+        return pid, st
+    except OSError:
+        return None, st
+
+
+def still_paused(st):
+    """Records in a watch status that are really still paused: same process (pid + start time) and in
+    state T. A job resumed by hand while no watch ran, or one that was reused / exited, does not count."""
+    out = []
+    for r in st.get("stopped") or []:
+        if not pid_alive(r.get("pid"), r.get("start")):
+            continue
+        info = proc_info(r["pid"])
+        if info and info[1] in ("T", "t"):
+            out.append(r)
+    return out
+
+
+def watch_summary_lines():
+    pid, st = watch_running()
+    lines = []
+    if pid:
+        age = now() - st.get("t", 0)
+        lines.append(f"watch: running (pid {pid}, scan {age:.0f} s ago, level {st.get('level')}"
+                     f"{', dry run' if st.get('dry_run') else ''})")
+    else:
+        lines.append("watch: not running - start it: dingo-pack watch --daemon")
+    for x in (st.get("stalled") or []) if pid else []:
+        lines.append("  stalled: " + stall_text(x))
+    for r in still_paused(st):
+        lines.append(f"  paused pid {r['pid']} {r.get('session') or '?'} {fmt_size(r.get('rss'))} since {hhmm(r['t'])}"
+                     f" ({r.get('reason')}) - resume: dingo-pack watch resume {r['pid']}")
+    return lines
+
+
+def cmd_watch(args):
+    action = args.action or "run"
+    wd = watch_dir()
+    if action == "status":
+        pid, st = watch_running()
+        if args.json:
+            print(json.dumps(dict(st, running=bool(pid)), ensure_ascii=False, default=str))
+            return EXIT_OK
+        for line in watch_summary_lines():
+            print(line)
+        if st:
+            print(f"  memory available {fmt_size(st.get('avail'))} of {fmt_size(st.get('total'))}; thresholds warn / stop / kill "
+                  + " / ".join(fmt_size(st.get('thresholds', {}).get(k)) for k in ('warn', 'stop', 'kill')))
+            for s in (st.get("sessions") or [])[:8]:
+                cap = f" cap {fmt_size(s['max'])}" if s.get("max") else ""
+                print(f"  {s['session'][:40]:<40} {fmt_size(s['rss']):>6} {s['procs']:>3} proc{cap}  {s.get('top_cmd', '')[:50]}")
+            for e in (st.get("events") or [])[-5:]:
+                print(f"  [{hhmm(e['t'])}] {e['kind']}: {e.get('msg', '')[:160]}")
+        return EXIT_OK
+    if action == "stop":
+        pid, _ = watch_running()
+        if not pid:
+            print("watch is not running")
+            return EXIT_OK
+        os.kill(int(pid), signal.SIGTERM)
+        print(f"stopped watch (pid {pid}); paused jobs stay paused - see dingo-pack watch status")
+        return EXIT_OK
+    if action == "resume":
+        # Under the control lock, so two `watch resume` calls and the watch's own scan cannot overwrite
+        # each other's view. A manual resume neither counts against nor resets max_auto_resumes.
+        protect = watch_config()["protect"]
+        spath, note = os.path.join(wd, "status.json"), os.path.join(wd, "resumed.json")
+        n = 0
+        with watch_control_lock():
+            st = read_json(spath, {}) or {}
+            recs = {int(r["pid"]): r for r in st.get("stopped") or []}
+            want = list(recs) if args.pids in ([], ["all"]) else [int(x) for x in args.pids]
+            for pid in want:
+                r = recs.get(pid)
+                if r:
+                    got = signal_record(r, signal.SIGCONT, protect)
+                    if got is None:
+                        print(f"pid {pid} is no longer the process that was paused; record dropped, nothing signalled")
+                        continue
+                else:                                   # not paused by watch: the user named it, plain SIGCONT
+                    try:
+                        os.kill(pid, signal.SIGCONT)
+                        got = [pid]
+                    except OSError:
+                        continue
+                n += 1
+                write_log({"t": now(), "op": "watch", "kind": "resumed", "pid": pid, "msg": "resumed by hand",
+                           "session": session_label(args)})
+                print(f"resumed pid {pid} ({len(got)} proc)")
+            # offline (no watch running) the status file is the only record: update it here, so `who --gate`
+            # does not keep seeing the job as paused; a running watch also reads the mailbox
+            if st:
+                st["stopped"] = [r for r in st.get("stopped") or [] if int(r["pid"]) not in want]
+                write_atomic(spath, json.dumps(st, ensure_ascii=False, default=str))
+            old = read_json(note, []) or []
+            write_atomic(note, json.dumps(old + [p for p in want if p not in old]))
+        if not n:
+            print("nothing to resume")
+        return EXIT_OK
+    # run
+    if args.daemon:
+        exe = [sys.executable, os.path.abspath(__file__), "watch"] + (["--dry-run"] if args.dry_run else []) + \
+              (["--interval", str(args.interval)] if args.interval else [])
+        logf = open(os.path.join(wd, "watch.out"), "a")
+        p = subprocess.Popen(exe, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL, start_new_session=True,
+                             env=dict(os.environ, DINGO_WATCH_CHILD="1"))
+        time.sleep(0.5)
+        print(f"watch started in the background (pid {p.pid}); log {os.path.join(wd, 'watch.out')}; stop: dingo-pack watch stop")
+        return EXIT_OK
+    lock = open(os.path.join(wd, "lock"), "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pid, _ = watch_running()
+        eprint(f"dingo-pack watch: already running (pid {pid})")
+        return 1
+    wc = watch_config()
+    if args.interval:
+        wc["interval"] = args.interval
+    w = Watcher(wc, dry_run=args.dry_run, out=sys.stdout)
+    stop = {"now": False}
+    signal.signal(signal.SIGTERM, lambda s, f: stop.update(now=True))
+    signal.signal(signal.SIGINT, lambda s, f: stop.update(now=True))
+    if not args.once:
+        print(f"dingo-pack watch: every {wc['interval']:g} s; warn / pause / kill below "
+              f"{fmt_size(wc['warn'])} / {fmt_size(wc['stop'])} / {fmt_size(wc['kill'])} available"
+              f"{' (dry run: alerts only)' if args.dry_run else ''}", flush=True)
+    n = 0
+    while not stop["now"]:
+        try:
+            take_resume_requests(w)                      # resumed by hand meanwhile
+        except OSError:
+            pass
+        try:
+            w.stall_scan()
+        except Exception as e:                           # noqa: BLE001
+            eprint(f"dingo-pack watch: status-line check failed: {e!r}")
+        try:
+            w.step()
+        except Exception as e:                           # noqa: BLE001 - a guard must keep guarding
+            eprint(f"dingo-pack watch: scan failed: {e!r}")
+        n += 1
+        if args.once or (args.scans and n >= args.scans):
+            break
+        t_end = now() + wc["interval"]
+        while not stop["now"] and now() < t_end:
+            time.sleep(min(0.2, wc["interval"]))
+    if w.stopped and not args.once:
+        w.event("exit", msg=f"watch exits; {len(w.stopped)} job(s) stay paused: dingo-pack watch resume all")
+    return EXIT_OK
+
+
+def cgroup_v2_memory():
+    """True if this user can put a process tree under its own memory.max (cgroup v2 with memory delegated)."""
+    root = os.environ.get("DINGO_FAKE_CGROUP_ROOT", "/sys/fs/cgroup")
+    try:
+        with open(os.path.join(root, "cgroup.controllers")) as f:
+            if "memory" not in f.read().split():
+                return False
+        with open(os.environ.get("DINGO_FAKE_PROC_CGROUP", "/proc/self/cgroup")) as f:
+            lines = f.read().split()
+        rel = next((ln.split("::", 1)[1] for ln in lines if ln.startswith("0::")), None)
+        if rel is None or len(lines) != 1:
+            return False                                  # v1 or hybrid: systemd-run MemoryMax has no effect
+        m = re.search(r"^(.*/user@\d+\.service)", rel)
+        if not m:
+            return False
+        with open(os.path.join(root, m.group(1).lstrip("/"), "cgroup.controllers")) as f:
+            return "memory" in f.read().split()
+    except OSError:
+        return False
+
+
+def cmd_session(args):
+    cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else args.cmd
+    if not cmd:
+        eprint("dingo-pack session: no command after --  (e.g. dingo-pack session --max 8G -- claude)")
+        return EXIT_USAGE
+    name = args.name or f"{os.path.basename(cmd[0])}-{os.getpid()}"
+    env = dict(os.environ, DINGO_SESSION=name)
+    if args.max:
+        env["DINGO_SESSION_MAX"] = str(args.max)
+    mode = "watch"
+    full = list(cmd)
+    if args.max and args.cgroup != "off" and shutil.which("systemd-run") and cgroup_v2_memory():
+        mode = "cgroup"
+        full = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={args.max}",
+                "-p", f"MemoryHigh={int(args.max * 0.9)}", "--"] + full
+    pid, _ = watch_running()
+    if args.max and mode == "watch" and not pid:
+        eprint("dingo-pack session: warning - the cap needs `dingo-pack watch` and it is not running "
+               "(start: dingo-pack watch --daemon)")
+    note = (f"dingo-pack session: {name}" + (f", cap {fmt_size(args.max)}" if args.max else "")
+            + {"cgroup": " (kernel cgroup: the tree cannot pass it)",
+               "watch": " (enforced by dingo-pack watch: pauses the biggest job of this session when over)"}[mode])
+    if args.dry_run:
+        print(note)
+        print("would run: " + shlex.join(full) if hasattr(shlex, "join") else " ".join(full))
+        print(f"env: DINGO_SESSION={name}" + (f" DINGO_SESSION_MAX={args.max}" if args.max else ""))
+        return EXIT_OK
+    if not args.quiet:
+        eprint(note)
+    try:
+        os.execvpe(full[0], full, env)
+    except OSError as e:
+        eprint(f"dingo-pack session: cannot start {full[0]}: {e}")
+        return 127
+
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="dingo-pack", description=DINGO + "\n" + __doc__.split("\n\n")[0],
@@ -4154,7 +5018,7 @@ def main(argv=None):
 
     def common(q):
         q.add_argument("--session", help="label for who / log (default: Claude Code session id)")
-        q.add_argument("--slots", type=int, help="number of heavy slots (default 6 / DINGO_SLOTS)")
+        q.add_argument("--slots", type=int, help="pin the number of heavy slots (default: not fixed - memory and CPU decide; DINGO_SLOTS)")
         q.add_argument("--timeout", type=parse_duration, default=None,
                        help="give up (exit 75) after this long waiting, e.g. 30m")
 
@@ -4182,34 +5046,56 @@ def main(argv=None):
     q.add_argument("--session")
     q.add_argument("ids", nargs="*")
 
+    q = sp.add_parser("watch", help="live memory guard: warn, pause (SIGSTOP) the biggest / fastest-growing job, kill only at the edge")
+    q.add_argument("action", nargs="?", choices=("run", "status", "stop", "resume"), default="run")
+    q.add_argument("pids", nargs="*", help="resume: pids (default all)")
+    q.add_argument("--daemon", action="store_true", help="start in the background and return")
+    q.add_argument("--dry-run", action="store_true", help="alerts only: never pause or kill")
+    q.add_argument("--once", action="store_true", help="one scan, then exit")
+    q.add_argument("--scans", type=int, help="stop after this many scans")
+    q.add_argument("--interval", type=float, help="seconds between scans (default 2)")
+    q.add_argument("--json", action="store_true")
+    q.add_argument("--session")
+
+    q = sp.add_parser("session", help="start an agent as a named session with a memory cap: session --name X --max 8G -- claude")
+    q.add_argument("--name", help="session label (default: command-pid)")
+    q.add_argument("--max", type=parse_size, help="memory cap for the whole session tree, e.g. 8G")
+    q.add_argument("--cgroup", choices=("auto", "off"), default="auto",
+                   help="auto: a real kernel cap via systemd-run when cgroup v2 memory is delegated; else watch enforces it")
+    q.add_argument("--dry-run", action="store_true")
+    q.add_argument("--quiet", action="store_true")
+    q.add_argument("cmd", nargs=argparse.REMAINDER)
+
     q = sp.add_parser("who", help="slot holders and the queue")
+    q.add_argument("--gate", action="store_true", help="exit 1 if there is no room for --need more (for launch scripts)")
+    q.add_argument("--need", type=parse_size, default=None, help="with --gate: memory a new session needs (default 4G)")
     q.add_argument("--slots", type=int)
     q.add_argument("--json", action="store_true")
 
-    q = sp.add_parser("board", help="one line per session: state, box, expected finish, ask-now / stopped flags")
+    q = sp.add_parser("board", help="[moving to shepherd-dispatch] one line per session: state, box, expected finish, flags")
     q.add_argument("--json", action="store_true")
     q.add_argument("--html", help="write a self-refreshing HTML page to this path")
     q.add_argument("--watch", type=float, help="refresh every N seconds")
     q.add_argument("--stale-h", type=float, default=3.0, help="flag a status line unchanged this many hours (default 3)")
 
-    q = sp.add_parser("name", help="next session name for a letter today (L-MMDD-what, then L2-, L3- ...)")
+    q = sp.add_parser("name", help="[moving to shepherd-dispatch] next session name for a letter today (L-MMDD-what, L2- ...)")
     q.add_argument("letter")
     q.add_argument("what", help="card number or short word, e.g. 0-196")
     q.add_argument("--suffix", help="e.g. ds-yi for a session on another account")
     q.add_argument("--date", help="MMDD (default today)")
 
-    q = sp.add_parser("card", help="card new: next free number, reserved here, with a skeleton")
+    q = sp.add_parser("card", help="[moving to shepherd-dispatch] card new: next free number, reserved here, with a skeleton")
     q.add_argument("action", choices=("new",))
     q.add_argument("title")
     q.add_argument("--out", help="write the skeleton to this file")
     q.add_argument("--registry", help="file that lists the numbers already used (read only)")
     q.add_argument("--session")
 
-    q = sp.add_parser("lint", help="naming, one-per-letter, stale / overdue status lines, missing status")
+    q = sp.add_parser("lint", help="[moving to shepherd-dispatch] naming, one-per-letter, stale / overdue / missing status lines")
     q.add_argument("--json", action="store_true")
     q.add_argument("--stale-h", type=float, default=3.0)
 
-    q = sp.add_parser("queue", help="prompts waiting for a condition: add / list / show / sent")
+    q = sp.add_parser("queue", help="[moving to shepherd-dispatch] prompts waiting for a condition: add / list / show / sent")
     q.add_argument("action", choices=("add", "list", "show", "sent"))
     q.add_argument("id", nargs="?", type=int)
     q.add_argument("--when", action="append", default=[], help="mark:NAME=done | file:PATH | at:HH:MM | alive:NAME | gone:NAME")
@@ -4219,7 +5105,7 @@ def main(argv=None):
     q.add_argument("--clip", action="store_true", help="show: also copy to the Windows clipboard")
     q.add_argument("--session")
 
-    q = sp.add_parser("claim", help="box occupancy file: list / check / add / wait / sweep / remove; done flags release lines, stale lines alert")
+    q = sp.add_parser("claim", help="[moving to boobook-watch] box occupancy file: list / check / add / wait / sweep / remove")
     q.add_argument("action", choices=("list", "check", "add", "remove", "wait", "sweep"))
     q.add_argument("--file")
     q.add_argument("--who")
@@ -4236,7 +5122,7 @@ def main(argv=None):
     q.add_argument("--json", action="store_true", help="list: machine-readable")
     q.add_argument("--session")
 
-    q = sp.add_parser("boxes", help="one line per box over read-only ssh: up / no GPUs / unreachable, cards, claims, disk, watchdog; note / history")
+    q = sp.add_parser("boxes", help="[moving to boobook-watch] one line per box over read-only ssh: up / cards / claims / disk / watchdog")
     q.add_argument("words", nargs="*", help="[box ...] | note BOX TEXT | history [BOX]")
     q.add_argument("--boxes", help="boxes.json (default $DINGO_BOXES or ~/.config/dingo-pack/boxes.json)")
     q.add_argument("--no-du", action="store_true", help="skip the per-directory sizes (du runs on the box, up to 90 s)")
@@ -4279,7 +5165,7 @@ def main(argv=None):
     q.add_argument("--json", action="store_true")
     q.add_argument("--no-refresh", action="store_true")
 
-    q = sp.add_parser("resume", help="reopen sessions from the roster")
+    q = sp.add_parser("resume", help="continue sessions from the roster: --via print prints the commands (kept); opening tabs (wt / tmux) is no longer maintained")
     q.add_argument("names", nargs="*")
     q.add_argument("--midway", action="store_true", help="all lost sessions marked / guessed midway")
     q.add_argument("--lost", action="store_true", help="all sessions lost in a reboot except done")
@@ -4300,11 +5186,11 @@ def main(argv=None):
     q.add_argument("--json", action="store_true")
     q.add_argument("ids", nargs="*", help="#k of the groups to reap (default: all not kept)")
 
-    q = sp.add_parser("close-all", help="remember every session and close the safe ones (idle + waiting / done)")
+    q = sp.add_parser("close-all", help="[no longer maintained] remember every session and close the safe ones (idle + waiting / done)")
     q.add_argument("--dry-run", action="store_true")
     q.add_argument("--sid", help=argparse.SUPPRESS)
 
-    q = sp.add_parser("restore", help="bring back the last batch (closed by close-all, or lost in a crash)")
+    q = sp.add_parser("restore", help="bring back the last batch (closed by close-all, or lost in a crash); opening tabs is no longer maintained, --via print stays")
     q.add_argument("names", nargs="*")
     q.add_argument("--all", action="store_true", help=argparse.SUPPRESS)
     q.add_argument("--via", choices=("wt", "tmux", "print"))
@@ -4313,12 +5199,12 @@ def main(argv=None):
     q.add_argument("--yes", action="store_true")
     q.add_argument("--dry-run", action="store_true")
 
-    q = sp.add_parser("stow", help="(advanced) note the live sessions; with --close, close the idle waiting / done ones")
+    q = sp.add_parser("stow", help="[no longer maintained] note the live sessions; with --close, close the idle waiting / done ones")
     q.add_argument("--close", action="store_true")
     q.add_argument("--dry-run", action="store_true")
     q.add_argument("--sid", help=argparse.SUPPRESS)
 
-    q = sp.add_parser("unstow", help="reopen what the last stow closed")
+    q = sp.add_parser("unstow", help="[no longer maintained: tabs] reopen what the last stow closed; --via print stays")
     q.add_argument("names", nargs="*")
     q.add_argument("--all", action="store_true", help="also sessions stow left running (if they are gone now)")
     q.add_argument("--via", choices=("wt", "tmux", "print"))
@@ -4327,25 +5213,30 @@ def main(argv=None):
     q.add_argument("--yes", action="store_true")
     q.add_argument("--dry-run", action="store_true")
 
+    for act in sp._choices_actions:                  # `dingo-pack X --help` shows X's one-line help too (moving / unmaintained)
+        q = sp.choices.get(act.dest)
+        if q is not None and q.description is None and act.help:
+            q.description = act.help
     args, extra = p.parse_known_args(argv)
     if extra:
         # Python < 3.12 drops a positional that follows an option
         # (`mark done --sid X finished` -> "unrecognized arguments: finished").
         # Put those words back on the subcommand's tail positional.
-        tail = {"mark": "note", "ghosts": "ids", "release": "ids",
+        tail = {"mark": "note", "ghosts": "ids", "release": "ids", "watch": "pids",
                 "resume": "names", "restore": "names", "unstow": "names"}.get(getattr(args, "sub", None))
         if tail is None or not hasattr(args, tail):
             p.error("unrecognized arguments: " + " ".join(extra))
         setattr(args, tail, list(getattr(args, tail) or []) + extra)
     if args.sub and not (args.sub == "save" and getattr(args, "hook", False)) and args.sub not in ("_probe", "claim"):
         check_local_state()
+    moved_note(args.sub)
     fn = {"run": cmd_run, "lease": cmd_lease, "release": cmd_release, "who": cmd_who, "log": cmd_log,
           "save": cmd_save, "mark": cmd_mark, "list": cmd_list, "resume": cmd_resume,
           "doctor": cmd_doctor, "ghosts": cmd_ghosts, "stow": cmd_stow, "unstow": cmd_unstow,
           "top": cmd_top, "close-all": cmd_close_all, "restore": cmd_restore, "board": cmd_board,
           "name": cmd_name, "card": cmd_card, "lint": cmd_lint, "queue": cmd_queue, "claim": cmd_claim,
           "boxes": cmd_boxes, "_probe": cmd_probe, "tokens": cmd_tokens,
-          "adapter": cmd_adapter}.get(args.sub)
+          "adapter": cmd_adapter, "watch": cmd_watch, "session": cmd_session}.get(args.sub)
     if not fn:
         return cmd_overview(args)
     return fn(args)

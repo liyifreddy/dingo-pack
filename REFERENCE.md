@@ -2,11 +2,22 @@
 
 The details behind the [README](README.md).
 
+
+## 0.5: what stays, what moves
+
+Core: `run` / `lease` / `who` (slots, memory admission, caps), `watch` / `session` (live guard,
+session caps, stalled status lines), the roster (`save`, `mark`, `list`, `resume --via print`),
+`doctor`, `ghosts`, `top`. Moving, still working here (one line on stderr says where):
+`board`, `name`, `card`, `lint`, `queue` → shepherd-dispatch; `claim`, `boxes` → boobook-watch.
+No longer maintained, still working: `close-all`, `stow`, and opening terminal tabs (`resume` /
+`restore` / `unstow` with `--via wt|tmux`; `--via print` stays). `DINGO_NO_MOVE_NOTE=1` silences
+the notes.
+
 ## Features
 
 | | |
 |---|---|
-| **Slots** | At most N heavy jobs run at once (default 6). The rest queue, roughly first come first served (the kernel wakes flock waiters, so the order is not strictly guaranteed). |
+| **Slots** | No fixed number by default: a heavy job goes in when its `--mem` fits (available − promised − reserve) and its `--threads` fit the CPU slots (one per core); otherwise it queues, roughly first come first served (the kernel wakes flock waiters, so the order is not strictly guaranteed). Pin a number with `slots` / `DINGO_SLOTS`. |
 | **Memory admission** | A job starts only if free memory covers its estimate + a reserve, after subtracting what already-running jobs have promised but not yet used. |
 | **Limits** | Each job runs under a per-process limit (`RLIMIT_DATA`) and a whole-process-tree limit. Over the limit, that job fails by itself; the machine does not. |
 | **Roster** | Snapshots the live Claude Code sessions (name, directory, state, last status line) as turns happen, at most once per 15 s. After a crash: `list` shows what was lost, `resume` reopens it in terminal tabs. |
@@ -104,7 +115,10 @@ dingo-pack log -n 20                                     # one JSON line per job
   process tree (default = `--limit`): a program that forks 8 workers, each under the
   per-process limit, is still caught. Over the tree limit the tree gets SIGTERM, then
   SIGKILL after 10 s, and `run` exits 137 with a line saying so.
-- Reserve: `max(1 GB, 10 % of RAM)` by default (`DINGO_RESERVE`). Slots: `DINGO_SLOTS` or
+- Reserve: `max(1 GB, 10 % of RAM)` by default (`DINGO_RESERVE`). Slot count: not fixed —
+  the ceiling is the number of CPU slots, and memory admission + CPU slots decide; `who` /
+  `who --json` (`capacity`) and `board` say how many more default-sized jobs fit and what
+  limits it. Pin it with `DINGO_SLOTS` or
   `--slots`.
 - The job inherits the slot lock: if `dingo-pack` itself is killed, the slot stays taken
   until the job is gone too. Nothing to clean up after a crash — the kernel drops flocks.
@@ -176,7 +190,8 @@ keyed by the project's absolute path:
 - Session name: a name you gave the session (`/rename`) wins; else the first match of
   `name_regex` in its first message; else Claude Code's automatic name.
 - Status line: the last line matching `status_regex` in the newest file matching
-  `log_glob` (`{name}` = session name).
+  `log_glob` (`{name}` = session name; relative to the session's cwd; the directory part may be a
+  pattern too, for logs kept per team outside the repo: `../hq-files/指挥台/*/日志/*_{name}.md`).
 
 ## WSL notes
 
@@ -193,14 +208,85 @@ free -g; cat /proc/sys/vm/min_free_kbytes
   `[wsl2]` / `memory=24GB` / `swap=8GB`, then `wsl --shutdown`.
 - Keep some memory free for the kernel: `vm.min_free_kbytes = 262144` in
   `/etc/sysctl.d/99-9p.conf`.
-- WSL2 uses cgroup v1 here, so `systemd-run -p MemoryMax=…` has no effect; rlimits
-  (`prlimit --data`, which is what `--limit` sets) do.
+- WSL2 uses cgroup v1 here, so `systemd-run -p MemoryMax=…` has no effect (checked: a 200 MB
+  scope let 500 MB through, with `MemoryMax` and `MemoryLimit`); rlimits (`prlimit --data`,
+  which is what `--limit` sets) do. A whole-session cap therefore comes from `watch`
+  (`dingo-pack session --max`). For a kernel cap, switch WSL to pure cgroup v2:
+  `kernelCommandLine = cgroup_no_v1=all` under `[wsl2]` in `.wslconfig`, then `wsl --shutdown`.
+
+## Watch and sessions
+
+| Command | What it does |
+|---|---|
+| `watch [--interval S] [--dry-run] [--once] [--scans N]` | foreground guard loop (single instance via `watch/lock`) |
+| `watch --daemon` / `watch stop` | start in the background (log `watch/watch.out`) / stop it; paused jobs stay paused |
+| `watch status [--json]` | level, memory per session, paused jobs, last events |
+| `watch resume [PID...\|all]` | SIGCONT a paused job's tree (each process re-checked, see below); works with or without a running watch |
+| `session [--name N] [--max SIZE] [--cgroup auto\|off] [--dry-run] -- CMD` | exec CMD with `DINGO_SESSION` / `DINGO_SESSION_MAX` set (systemd-run MemoryMax where cgroup v2 memory is delegated) |
+| `who --gate [--need SIZE]` | exit 1 if room after promised + reserve < need (default 4G), all slots are held, or a job is really still paused by watch (same process, state T) |
+
+Levels (config `"watch"` or `DINGO_WATCH_*`; sizes or `"15%"`): `warn` max(4G, 15 %) → alert;
+`stop` max(2.5G, 8 %) → SIGSTOP the fastest-growing (> 128 MB in the window), else the biggest
+job tree; `kill` max(1.2G, 4 %) → SIGKILL the biggest (paused ones included). Other keys:
+`interval` 2, `min_target` 256M, `grow_warn` 2G, `grow_window` 60 s, `cooldown` 5 s between
+actions, `alert_every` 120 s per alert, `unowned` alert|stop, `auto_resume` true (machine-level
+pauses only, after `resume_hold` 20 s, when available > warn + max(1G, half the job)),
+`max_auto_resumes` 2 (per process over all its pause cycles; the count is kept in
+`watch/status.json` across watch restarts and starts over only when that pid names a new
+process; a manual `watch resume` neither counts nor resets it), `protect` (extra command names
+never touched). Events: `watch/events.jsonl` and `log.jsonl` (`op: watch`); status:
+`watch/status.json`.
+
+Stalled status lines: every `stall_every` (300 s; 0 = off, off by default under `DINGO_SCOPE_TAG`)
+watch refreshes the roster the way `board` does (status lines from each session's log, per
+project `log_glob` / `status_regex`; bounded to 30 s, so a hung mount cannot stop the guard). A
+live session whose line `【状态 …】<word> · …` says one of `stall_words` (default `["跑着"]`) and
+has not changed for `stall_h` hours (default 2; since the earlier of when dingo saw the line change
+and the line's own time) gives a `status-stalled` event (once per line, again every `stall_h`),
+a `stalled` list in `status.json`, a `stalled:` line in `who` (while watch runs) and in `board`
+(computed there, also without watch) and a `stalled N h` flag on the board row. 已交 / 已关 /
+等 Yi / 等指挥 / 卡住 and ended sessions are not reported. `DINGO_WATCH_STALL_H`,
+`DINGO_WATCH_STALL_EVERY`.
+
+Signal safety: a pause record keeps pid, start time and owner of every process in the tree
+(`members`). Before each SIGSTOP / SIGCONT / SIGKILL every member is checked again (same start
+time, same owner, not now an agent or protected command, not exited; with Python 3.9+ through a
+pidfd, so the check and the signal hit the same process); a member that fails is skipped, and if
+the root itself changed the whole record is dropped and nothing is signalled. Records from
+before this change hold only the root's start time: their other pids are never signalled.
+`watch resume` and the watch share `watch/control.lock` for the resume mailbox
+(`watch/resumed.json`) and `status.json`: concurrent resumes are all kept, and with no watch
+running `watch resume` updates `status.json` itself.
+
+Attribution: `DINGO_SESSION` in the environment, else `CLAUDE_PID` (name from Claude Code's
+session file), else the nearest ancestor whose command name is an agent (claude, codex,
+opencode, hermes, ...). Never targeted: agent processes, shells, tmux, systemd, sshd, the
+watch itself and its ancestors, other users' processes. `DINGO_SCOPE_TAG` narrows everything to
+processes carrying the same tag (tests).
+
+## Enforcing hook
+
+`hooks/hint.py` with `DINGO_ENFORCE=1` (or config `"hook": {"enforce": true}`) answers heavy
+Bash calls with `permissionDecision: deny` and a rewritten command. Config `"hook"`:
+`heavy_words` (list), `heavy_scripts` / `light_scripts` (regex on the script path),
+`enforce_io` (default true: bulk io on network / 9p mounts is denied; single-file cp / mv is
+only hinted), `small_scan` (default 500). `grep -r` / `rg` are judged by what they scan: a
+file, a directory tree of at most `small_scan` entries, or `rg --max-depth 1` passes; a bigger
+tree (or one that takes over 0.8 s to list) is denied. Shell wrappers are opened up also with
+`-c` among other options (`bash -lc`, `sh -ec`, `bash -o pipefail -c`), after `env …` /
+`command`; a `cd DIR` moves the directory relative paths of the following commands are judged
+in (a subshell's `cd` does not leak). Not covered: how much memory an inline `python -c` will
+take (`python3 -c "b=bytearray(2*1024**3)"` passes) - that is left to `--mem`, the rules in
+AGENTS.md and `watch`.
 
 ## Self-test in full
 
 ```bash
 python3 selftest_dingo_pack.py --base /some/local/dir     # ~40 s
 python3 selftest_dingo_pack.py --mutants                  # each mutant must turn a check red
+python3 selftest_hook.py && python3 selftest_slots.py && python3 selftest_watch.py
+python3 selftest_watch_control.py                          # watch signal safety / resume state (simulated pids)
+python3 selftest_stall.py                                  # stalled 跑着 status lines in watch / who / board
 ```
 
 Memory tests never stress the real machine: they run against a simulated one — a

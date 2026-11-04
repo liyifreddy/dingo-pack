@@ -5,19 +5,27 @@
        alt="四只野犬在分成四格的食槽前并排吃，另外三只在旁边等着轮到">
 </p>
 
-**像浏览器的标签页收纳，只不过收的是 Claude Code session。**
+**一台电脑上一群 agent：重活排名额、按内存准入、跑起来实时盯、登记谁在跑、死机后知道丢了谁。**
 
 ```sh
-dingo-pack save          # 记住现在开着的 session（hook 也会自动记）
-dingo-pack close-all     # 记住，并关掉空闲、在等或已完成的那些
-dingo-pack restore       # 把最后一批放回来，每个开一个终端标签
+dingo-pack run --heavy --mem 4G -- pytest   # 先等名额和空闲内存，再在上限下跑
+dingo-pack watch --daemon                   # 盯本用户所有进程：报警、挂起、放开，到边上才停
+dingo-pack who                              # 谁在跑什么、还能放几件、谁被挂起、谁的状态行停住了
+dingo-pack list                             # 死机之后：哪些 session 丢了
+dingo-pack resume --midway --via print      # 打印每个的续起命令
 ```
 
 🌐 [English](https://github.com/liyifreddy/dingo-pack/blob/main/README.md) · **中文**
 
-野犬群按次序吃：一群澳洲野犬分食的时候不抢不挤。dingo-pack 是一台机器上十几个编程 agent 的「狗王」，还会给重活发名额，机器吃不消的时候帮你查哪里出了问题。
+野犬群按次序吃：一群澳洲野犬分食的时候不抢不挤。dingo-pack 是一台机器上十几个编程 agent 的「狗王」，核心五件事：
 
-`restore` 在 WSL 里会给每个 session 开一个 Windows Terminal 新标签；在 tmux 里开 tmux 窗口；别的情况下只打印命令，你自己粘贴。`close-all` 只关空闲、而且自己说了在等或已完成的 session；这条命令只给人用，在 agent 里会被拒绝。
+1. **重活排名额**：测试、构建、训练、导出排队（`run --heavy`）。
+2. **按内存准入**：申报的峰值放得下（可用 − 已承诺给在跑的 − 余量）才进；CPU 名额 = 核数；不钉死个数。
+3. **跑起来实时盯**：`watch` 看本用户所有进程，没走 dingo 的也看：报警、挂起（SIGSTOP）会把机器拖垮的那件、有余量了放开、到边上才停；状态行写「跑着」却 2 小时没动的会话也报。
+4. **登记谁在跑**：`who` 和名册：有哪些 session、各自的活、内存、状态行。
+5. **死机后知道丢了谁**：名册边干边存（`save` / `mark`）；`list` 列出丢了谁，`resume --via print` 打印每个的续起命令。双保险：dingo 管这台机器上所有会话，shepherd-dispatch 管它自己起的。
+
+在搬家的（这里照样能用，运行时会说新家在哪）：`board`、`name`、`card`、`lint`、`queue` → shepherd-dispatch；`claim`、`boxes` → boobook-watch。不再维护的（照样能用）：`close-all`、`stow`，以及开终端标签（`resume` / `restore` / `unstow` 带 `--via wt|tmux`）；`--via print` 留着。
 
 ## 🚀 快速上手
 
@@ -123,7 +131,7 @@ OOM 的证明；由监督器触发的整树超限则明确标为已确认。普�
 
 - ✅ 🎟️ **名额和内存。** `run --heavy` 先等一个空名额（默认 6 个），再等内存够用，然后给整件活（连同它开的子进程）套上内存上限。在一台假装只有 350 MB 的机器上，四件 150 MB 的活一起跑会被系统杀掉；走 dingo-pack 四件都能跑完。
 - ✅ 🚚 **慢盘单独一条道。** `run --io` 让网络盘 / 9p 盘上的大拷贝、打包、扫描单独排队（一次一个），不跟算力活抢。
-- ✅ 📋 **名册：收起、放出、召回。** 关机前 `close-all` 记下所有 session，并关掉那些空闲、而且在等或已完成的；之后 `restore` 一键放回来；死机之后 `restore` 也能用，它会放回死机时丢掉的那些。
+- ✅ 📋 **名册：谁在跑、丢了谁。** session 边干边记（`save`、`mark`）；死机之后 `list` 列出丢了谁，`resume --via print` 打印每个的续起命令。（`close-all` / `stow` 批量关、开终端标签不再维护。）
 - ✅ 👻 **幽灵进程和子 agent 提示。** `ghosts` 找出主人已经不在的进程。提示 hook 会在 agent 开子 agent 或跑重命令之前告诉它：还剩几个名额、还有多少内存、现在最多该并行几件。
 - ✅ 🩺 **一次查完。** `doctor` 看内存、最近有没有被 OOM 杀掉的进程、每个网络盘还应不应答、WSL 设置、卡住的名额、丢了的 session、幽灵进程，以及 git 的锁文件（通过 [wombat-gate](https://github.com/liyifreddy/wombat-gate)）。只报告，不替你改。
 
@@ -147,6 +155,28 @@ dingo-pack top                                            # 每个 session 用�
 - `--threads N`（默认 8）给这件活设好 `OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 等线程数，并占用 N 个 CPU 名额（全机名额数 = 核数）。负载超过每核 1.5 时，`doctor` 和提示 hook 会报警。
 - `--mem` 填你估计的最高用量。上限默认是它的 1.5 倍；超了只停你这件（单个进程会遇到 MemoryError 自己退出，整棵进程树超了会被停掉、退出码 137），不会拖垮整台机器。
 - 不是一条 shell 命令的重活（agent 自己的审查、一批子 agent），用租约：`dingo-pack lease --mem 3G --for 45m`，做完 `dingo-pack release`。agent 退出时租约也会自动放掉。
+- **名额不是固定个数**：默认不设上限个数，能放几件由内存和 CPU 定——申报的 `--mem` 放得进「可用 − 已承诺给在跑的 − 余量」就放，放不下就排队；每件按 `--threads` 占 CPU 名额，CPU 名额 = 核数。`who` 会写「现在还能放几件、按什么算的」。要钉死个数：配置 `"slots": N` 或 `DINGO_SLOTS`；余量：`"reserve"` 或 `DINGO_RESERVE`（默认 max(1 GB, 内存的 10 %)）。
+- **慢盘**：能把数据拷到 WSL 本地盘（`~/`、`/tmp`）上跑的，先拷过去跑，结果再写回；非在 `/mnt/…` 上大量读写不可的，走 `run --io`。
+
+### 强制：不走 dingo 的重活直接拦下（Claude Code）
+
+提示 hook 加 `DINGO_ENFORCE=1`（或配置 `"hook": {"enforce": true}`）就从「提示」变成「拦」：像重活的 Bash 命令（pytest、`python run_all.py`、train / eval / export / regress 脚本、make、MinerU……；会拆开 `bash -c`、`bash -lc`、`env … bash -c`、`timeout`、`nohup`、`uv run`、`conda run`）没走 `dingo-pack run` 的被拒，拒绝理由里给出改好的命令；`/mnt/…` 上的批量拷贝、打包、不带 `-maxdepth` 的 `find`、扫大目录树的 `grep -r` / `rg` 也拒；`rg` / `grep -r` 查单个文件或小目录放行，单个文件的 `cp` 只提示，前面先 `cd ~/x && …` 的按 cd 之后的目录算。inline `python -c` 要吃多少内存判断不了，靠 `--mem`、规矩和 `watch`。子 agent、审查 skill 只提示（包不住）。hook 自己出错一律放行。规则可在配置 `"hook"` 里加：`heavy_words`、`heavy_scripts`（正则）、`light_scripts`（正则，永远不算重活）、`enforce_io`。
+
+### 跑着的时候也盯：`watch`
+
+```sh
+dingo-pack watch --daemon          # 后台常驻（单实例）；dingo-pack watch stop 停
+dingo-pack watch status            # 每个会话用了多少、谁被挂起了、最近的报警
+dingo-pack watch resume 12345      # 接着跑被挂起的那件（或 all）
+dingo-pack session --name 科X --max 8G -- claude ...   # 起一个带名字、带上限的会话
+```
+
+- 每 2 秒看一遍本用户的所有进程，**包括没走 dingo 起的**：按环境里的 `DINGO_SESSION` / `CLAUDE_PID`、否则最近的 agent 祖先进程（claude / codex / opencode / hermes）归到会话。
+- 整机可用内存低于 warn（默认 max(4 GB, 15 %)）或某个进程 60 秒涨了 2 GB 以上 → 先报警（`watch/events.jsonl`、dingo 日志、`who`）；低于 stop（max(2.5 GB, 8 %)）→ 挂起（SIGSTOP）涨得最快的、否则最大的那件，不丢活，有余量了自动 SIGCONT 接着跑（每件最多自动两次，跨挂起周期、跨 watch 重启都算；之后等 `watch resume`；每次发信号前逐个进程重核启动时间和属主，PID 被复用了不会误伤）；低于 kill（max(1.2 GB, 4 %)）→ 停掉最大的那件，事件里写清停了谁、为什么、怎么接着跑。会话超了 `session --max` → 挂起这个会话里最大的那件，不自动放。
+- agent 进程本身、shell、tmux、systemd 永远不动；不属于任何会话的进程默认只报警（`"watch": {"unowned": "stop"}` 才动）。阈值都可配：`"watch": {"warn", "stop", "kill", "interval", "grow_warn", ...}` 或 `DINGO_WATCH_WARN` 等。开销：本机 160 个进程，单核约 0.5 %，常驻 30 MB。
+- `session --max`：cgroup v2 且内存控制器委派给用户时，用 `systemd-run --user --scope -p MemoryMax=…` 交给内核硬限；WSL2 默认是 cgroup v1，那里 `MemoryMax` 不生效，改由 `watch` 执行。
+- 每 5 分钟还照 `board` 的读法读一遍各会话日志末尾的状态行：状态词是「跑着」、2 小时（`"watch": {"stall_h": 2}`）没变的，写进 watch 事件，`who` / `board` 里出一行 `stalled:`（哪个会话、停了多久、日志在哪）。「已交 / 已关 / 等 Yi」的不报。
+- `dingo-pack who --gate --need 4G`：起新会话前用，余量不够、或有活确实还被 watch 挂着时退出 1。watch 没开着也能 `watch resume`，放开之后 gate 就放行。
 
 ## 📋 名册
 
@@ -164,9 +194,10 @@ dingo-pack top                                            # 每个 session 用�
 ```sh
 dingo-pack mark running "第 3 步"          # 报一下自己在干嘛：running | waiting | blocked | done
 dingo-pack mark waiting --until 18:30 "等夜里的任务"
-dingo-pack close-all                    # 关机前：记下所有人，关掉空闲的、在等或已完成的
-dingo-pack restore                         # 把 close-all 关掉的放回来
-dingo-pack resume 名字… --via tmux         # 按名字打开；可以用 Windows Terminal、tmux，或只打印命令
+dingo-pack list                            # 死机之后：丢了谁
+dingo-pack resume NAME... --via print      # 打印每个的续起命令，自己粘贴
+dingo-pack close-all                       # （不再维护）关掉空闲的、在等或已完成的
+dingo-pack restore                         # （开标签不再维护）把 close-all 关掉的放回来
 ```
 
 `close-all` 不碰正在忙、正在跑、卡住等人的 session，也不碰你敲命令的这一个；关每一个之前都会再确认一次它的状态。这条命令只给人用，在 agent 里会被拒绝。
@@ -182,6 +213,8 @@ dingo-pack ghosts --reap          # 问过你之后把它们停掉（只给人�
 
 ## 📊 看板
 
+> 在搬到 shepherd-dispatch（这里照样能用；`name`、`card`、`lint`、`queue` 同）。`claim` / `boxes` 搬到 boobook-watch。
+
 ```sh
 dingo-pack board                  # 每个 session 一行：状态、box、预计完成、提醒
 dingo-pack board --html board.html --watch 30   # 生成一个会自己刷新的网页
@@ -191,6 +224,8 @@ dingo-pack board --html board.html --watch 30   # 生成一个会自己刷新的
 
 ## 🧰 团队惯例（可选）
 
+> 跟看板一起搬到 shepherd-dispatch。
+
 `name`（某个字母今天的下一个 session 名）、`card new`（下一个空卡号 + 卡头骨架）、`lint`（命名、同字母只活一个、状态行过期或预计已过）、`queue`（等条件的待发 prompt）、`claim`（每台 box 的占用登记文件）。全是确定性的，不调用就不起作用，详见 [REFERENCE.md](REFERENCE.md)。
 
 ## ⚙️ 更多
@@ -199,8 +234,10 @@ dingo-pack board --html board.html --watch 30   # 生成一个会自己刷新的
 
 ## ⚠️ 局限
 
-- agent 进程本身限制不了，只能用租约把它算进去。
-- 只管通过 dingo-pack 启动的活。
+- agent 进程本身限制不了，只能用租约把它算进去；`watch` 不挂起、不停 agent 进程。
+- 名额和内存准入只管通过 dingo-pack 启动的活；没走 dingo 的只有 `watch` 看得到、能挂起，`watch` 没开着就谁都管不到。
+- 强制 hook 只有 Claude Code 实测过；Codex / OpenCode 靠 AGENTS.md 里的规矩 + `watch` 兜底。
+- `watch` 是每 2 秒抽样：比这还快的一下子吃满，它来不及；WSL2 的 cgroup v1 下没有内核硬限。
 - 名额大致先到先得（谁先醒由内核决定）。
 - macOS：单进程上限不生效（整棵上限有效），空闲内存是估算的；`ghosts`、`top` 和 WSL 检查只在 Linux 上可用。
 - 名册读的是 Claude Code 自己的 session 文件，这不是公开接口。格式变了的话，会改为只看会话记录，并且会说明。

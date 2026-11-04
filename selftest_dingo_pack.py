@@ -1022,7 +1022,7 @@ def t_who_json(E):
                            capture_output=True, text=True, env=henv)
         ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout.strip() else ""
         check("hint: carries slots, free memory and 'at most 2 in parallel'",
-              "heavy slots 1/6" in ctx and "at most 2" in ctx, ctx)
+              ("heavy slots 1/6" in ctx or "heavy jobs 1 running" in ctx) and "at most 2" in ctx, ctx)
         E.run("lease", "--mem", "2G", "--for", "5m", env=dict(env, DINGO_OWNER_PID=str(owner.pid)))
         r = subprocess.run([PY, os.environ.get("SELFTEST_HINT") or hint],
                            input=json.dumps({"tool_name": "Agent", "tool_input": {}}),
@@ -1934,8 +1934,8 @@ MUTANTS = [
     ("until sorted as raw text", '        grp.sort(key=lambda s: (until_key((s.get("mark") or {}).get("until")),',
      '        grp.sort(key=lambda s: (((s.get("mark") or {}).get("until") or ""),', ["t_roster"]),
     ("hint: any mention of dingo-pack counts as wrapped",
-     "        segs = segments(cmd)",
-     '        segs = [] if "dingo-pack" in cmd else segments(cmd)', ["t_hint"], "hint"),
+     "        segs, cwds = flatten(cmd, here())",
+     '        segs, cwds = ([], []) if "dingo-pack" in cmd else flatten(cmd, here())', ["t_hint"], "hint"),
     ("hint: split before quoting", "    return out\n\n\ndef segment_heavy(w):",
      "    return [x.split() for x in re.split(r'&&|;|\\|', cmd)]\n\n\ndef segment_heavy(w):", ["t_hint"], "hint"),
     ("hint: suggests bare name from the plugin",
@@ -1969,8 +1969,8 @@ MUTANTS = [
      "    if gs is not None:\n        loose = list(gs)", ["t_ghosts"]),
     ("io lane shares the heavy slots", 'LANE_DIRS = {"heavy": "slots", "io": "io-slots"}',
      'LANE_DIRS = {"heavy": "slots", "io": "slots"}', ["t_io_lane"]),
-    ("suggest_parallel ignores promised memory", "    room = (avail - reserve - prom) if avail is not None else None",
-     "    room = (avail - reserve) if avail is not None else None", ["t_who_json"]),
+    ("suggest_parallel ignores promised memory", "    by_mem = None if avail is None else max(0, int((avail - reserve - prom) // dm) if dm else n)",
+     "    by_mem = None if avail is None else max(0, int((avail - reserve) // dm) if dm else n)", ["t_who_json"]),
     ("hint: io check ignores where the paths are", "    return any(on_net(a) for a in w[1:] if not a.startswith(\"-\"))",
      "    return True", ["t_who_json"], "hint"),
     ("no overview without arguments", "        return cmd_overview(args)", "        p.print_help()\n        return EXIT_USAGE", ["t_overview_top"]),
