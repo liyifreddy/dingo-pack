@@ -40,25 +40,27 @@ dingo-pack resume --midway                    # 把做到一半的重新打开
 
 一个文件，Python ≥ 3.8，只用标准库。Linux、macOS、WSL 都能用。
 
-## 候选版本与安装演示
+## 版本与安装演示
 
-候选源码版本为 **0.4.1**（0.4.0 功能加内存提示与打包修复）。GitHub 公开 release
-为 **0.1.1**。0.4.1 尚未部署或发布。
-相较公开版本，增加 `boxes`、`tokens`、适配器校验及任务与等待列；`watch`、`dispatch`
-和完整三表 crosscheck 仍是设计。见 [CHANGELOG](CHANGELOG.md) 与 [发布步骤](RELEASING.md)。
-
-在审过的 checkout 中用独立环境试装：
+当前发布版本 **0.4.2**，可用 pip 或 pipx 从 PyPI 安装：
 
 ```sh
-python3 -m venv .venv-demo
-.venv-demo/bin/python -m pip install .
+python3 -m pip install dingo-pack        # 或：pipx install dingo-pack
+dingo-pack --version
+```
+
+想从这份源码装，用独立环境：
+
+```sh
+python3 -m venv .venv-demo && .venv-demo/bin/python -m pip install .
 .venv-demo/bin/dingo-pack --version
 .venv-demo/bin/dingo-pack run --heavy --threads 1 --mem 64M -- python3 -c 'print("hello")'
 ```
 
-预期输出 `dingo-pack 0.4.1`、`hello`；资源准入可能需要排队。状态与锁放本地盘，
-`DINGO_HOME` 保持默认，不放 WSL 挂载盘。上面的 GitHub 快速安装命令装公开代码，
-本地候选应从 checkout 试装。
+两条路预期都打 `dingo-pack 0.4.2`；源码那条还会打 `hello`，资源准入可能需要排队。
+状态与锁放本地盘，`DINGO_HOME` 保持默认，不放 WSL 挂载盘。已含 `boxes`、`tokens`、
+适配器校验及任务与等待列；`watch`、`dispatch` 和完整三表 crosscheck 仍是设计。
+见 [CHANGELOG](CHANGELOG.md) 与 [发布步骤](RELEASING.md)。
 
 ## 平台与 agent
 

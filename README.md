@@ -45,26 +45,29 @@ In Claude Code, install the plugin and the roster saves itself:
 
 One file, Python ≥ 3.8, standard library only. Linux, macOS and WSL.
 
-## Candidate release and installation demo
+## Release and installation demo
 
-Release candidate source: **0.4.1** (0.4.0 functionality plus diagnostics and packaging fixes).
-The public GitHub release is **0.1.1**. 0.4.1 is not deployed or published yet. It adds
-`boxes`, `tokens`, adapter validation, and task/wait columns to the released CLI.
-`watch`, `dispatch` and full three-table crosscheck remain design proposals.
-See [CHANGELOG](CHANGELOG.md) and [release procedure](RELEASING.md).
-
-From a reviewed checkout, use a separate environment to try the candidate:
+Current release: **0.4.2**. Install it from PyPI with pip or pipx:
 
 ```sh
-python3 -m venv .venv-demo
-.venv-demo/bin/python -m pip install .
+python3 -m pip install dingo-pack        # or: pipx install dingo-pack
+dingo-pack --version
+```
+
+To install from this source tree instead, use a separate environment:
+
+```sh
+python3 -m venv .venv-demo && .venv-demo/bin/python -m pip install .
 .venv-demo/bin/dingo-pack --version
 .venv-demo/bin/dingo-pack run --heavy --threads 1 --mem 64M -- python3 -c 'print("hello")'
 ```
 
-Expected: `dingo-pack 0.4.1`, then `hello` (admission may wait). State and locks must
-live on a local disk; leave `DINGO_HOME` at its default, outside a WSL mounted drive.
-The GitHub quick-start command installs the public revision, not this local candidate.
+Expected from either: `dingo-pack 0.4.2`; the source demo also prints `hello`
+(admission may wait). State and locks must live on a local disk; leave `DINGO_HOME`
+at its default, outside a WSL mounted drive. `boxes`, `tokens`, adapter validation
+and task/wait columns are included; `watch`, `dispatch` and full three-table
+crosscheck remain design proposals. See [CHANGELOG](CHANGELOG.md) and
+[release procedure](RELEASING.md).
 
 ## Platforms and agents
 

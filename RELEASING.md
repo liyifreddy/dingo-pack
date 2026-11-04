@@ -21,10 +21,10 @@ No failed upload log exists yet. The environment protection remains enabled.
 3. GitHub Settings → Environments → `pypi` 核 required reviewer。保留人工审批。
    PyPI 上 environment 必须与工作流完全相同。PyPI 当前账号设置本次核查没有读取，需由维护者核实。
 4. 提交候选并完成独立核验后，先看 test workflow 结果；macOS/Windows 未绿不能写成已实测。
-   审核版本号后由授权发布者创建匹配的 release tag（候选当前为 `v0.4.1`）。
+   审核版本号后由授权发布者创建匹配的 release tag（当前为 `v0.4.2`）。
    新流程先构建、自测、检查元数据与清单，再进受保护的上传 job。
 5. 到对应 Actions run 点 Review deployments，核对 tag、提交和构建产物后，选择 `pypi` 并批准。
-   本次旧 run 针对 v0.1.1；它不包含本地修复，不能用它发布 0.4.1。
+   本次旧 run 针对 v0.1.1；它不包含本地修复，不能用它发布 0.4.2。
 6. 上传完成后核 PyPI 版本，在干净环境安装精确版本并跑版本与 hello 冒烟。
    若上传失败，再留存该次 `gh run view <id> --log-failed`，按实际 OIDC 错误排查 publisher 字段。
 
@@ -32,7 +32,7 @@ For PyPI, add an existing or pending GitHub Trusted Publisher with owner `liyifr
 repository `dingo-pack`, filename `publish.yml`, environment `pypi`. No token is needed.
 After review and committing, an authorized publisher creates the matching release and
 approves its GitHub environment deployment. Verify the uploaded exact version in a clean
-venv. The old waiting run publishes 0.1.1, not this candidate.
+venv. The old waiting run publishes 0.1.1, not 0.4.2.
 
 ## 本地检查 / Local checks
 
