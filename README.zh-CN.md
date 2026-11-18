@@ -15,7 +15,7 @@ dingo-pack list                             # 死机之后：哪些 session 丢�
 dingo-pack resume --midway --via print      # 打印每个的续起命令
 ```
 
-🌐 [English](https://github.com/liyifreddy/dingo-pack/blob/main/README.md) · **中文**
+🌐 [English](https://github.com/liyifreddy/dingo-pack/blob/main/README.md) · [Deutsch](https://github.com/liyifreddy/dingo-pack/blob/main/README.de.md) · **中文**
 
 野犬群按次序吃：一群澳洲野犬分食的时候不抢不挤。dingo-pack 是一台机器上十几个编程 agent 的「狗王」，核心五件事：
 

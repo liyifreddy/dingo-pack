@@ -15,7 +15,7 @@ dingo-pack list                             # after a crash: which sessions were
 dingo-pack resume --midway --via print      # the command that continues each of them
 ```
 
-🌐 **English** · [中文](https://github.com/liyifreddy/dingo-pack/blob/main/README.zh-CN.md)
+🌐 **English** · [Deutsch](https://github.com/liyifreddy/dingo-pack/blob/main/README.de.md) · [中文](https://github.com/liyifreddy/dingo-pack/blob/main/README.zh-CN.md)
 
 The pack eats in order: dingoes share a kill without a scramble. dingo-pack is the pack
 leader for a dozen coding agents on one machine. Its five core jobs:
