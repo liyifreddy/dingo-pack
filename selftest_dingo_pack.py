@@ -2488,7 +2488,7 @@ def t_stall_last_line(E):
     """the session's *current* status line counts. Sessions often keep their
     status line at the top of the log and edit it in place, while someone else adds or inserts a line
     further down (someone else's closing note, a correction). The one with the later own time wins; position breaks
-    ties. A session that moved on to 等指挥 / 等 Yi / 已交 is never reported as stalled."""
+    ties. A session that moved on to waiting / blocked / done is never reported as stalled."""
     probe = E.path("stall_probe.py")
     with open(probe, "w") as f:
         f.write("import importlib.util, json, os, sys, time\n"
@@ -2498,27 +2498,27 @@ def t_stall_last_line(E):
                 "m = importlib.util.module_from_spec(spec); ld.exec_module(m)\n"
                 "base = sys.argv[2]; H = 3600; t = time.time()\n"
                 "st = lambda dt: time.strftime('%m-%d %H:%M', time.localtime(t + dt))\n"
-                "pc = {'log_glob': 'log/*_{name}.md', 'status_regex': '【状态'}\n"
+                "pc = {'log_glob': 'log/*_{name}.md', 'status_regex': '^Status'}\n"
                 "os.makedirs(os.path.join(base, 'log'), exist_ok=True)\n"
-                "pad = ''.join('- 第 %d 行 做了点事，读数照常，没有状态词\\n' % k for k in range(4000))\n"
+                "pad = ''.join('- line %d did a thing, readings as usual, no status word\\n' % k for k in range(4000))\n"
                 "cases = {\n"
-                "  # top line edited in place to 等指挥 (newer); an older 跑着 inserted further down, big log\n"
-                "  'top-wait-big': ('# log\\n\\n【状态 柏林 %s】等指挥 · 交了第 3 段\\n\\n' % st(-600) + pad[:len(pad)//2]\n"
-                "                   + '【状态 柏林 %s】跑着 · 更正：已续起\\n' % st(-5 * H) + pad, '等指挥'),\n"
-                "  'top-handed-small': ('# log\\n\\n【状态 柏林 %s】已交 · 交了\\n\\n- x\\n【状态 柏林 %s】跑着 · 更正\\n- y\\n'\n"
-                "                       % (st(-300), st(-4 * H)), '已交'),\n"
-                "  'top-wait-yi': ('# log\\n【状态 柏林 %s】等 Yi · 要定 y\\n- x\\n【状态 柏林 %s】跑着 · 旧行\\n' % (st(-60), st(-6 * H)), '等 Yi'),\n"
+                "  # top line edited in place to waiting (newer); an older running inserted further down, big log\n"
+                "  'top-wait-big': ('# log\\n\\nStatus %s: waiting - part 3 handed in\\n\\n' % st(-600) + pad[:len(pad)//2]\n"
+                "                   + 'Status %s: running - correction: resumed\\n' % st(-5 * H) + pad, 'waiting'),\n"
+                "  'top-handed-small': ('# log\\n\\nStatus %s: done - handed in\\n\\n- x\\nStatus %s: running - correction\\n- y\\n'\n"
+                "                       % (st(-300), st(-4 * H)), 'done'),\n"
+                "  'top-blocked': ('# log\\nStatus %s: blocked - needs a decision on y\\n- x\\nStatus %s: running - old line\\n' % (st(-60), st(-6 * H)), 'blocked'),\n"
                 "  # the usual layout: lines appended at the end, the last one is the newest\n"
-                "  'append': ('# log\\n【状态 柏林 %s】跑着 · a\\n- x\\n【状态 柏林 %s】等指挥 · b\\n' % (st(-5 * H), st(-60)), '等指挥'),\n"
-                "  # top line is old 跑着, someone appended a newer 已关 at the end: the end wins\n"
-                "  'top-old-end-closed': ('# log\\n【状态 柏林 %s】跑着 · a\\n' % st(-5 * H) + pad\n"
-                "                         + '【状态 柏林 %s】已关 · 关窗\\n' % st(-60), '已关'),\n"
+                "  'append': ('# log\\nStatus %s: running - a\\n- x\\nStatus %s: waiting - b\\n' % (st(-5 * H), st(-60)), 'waiting'),\n"
+                "  # top line is old running, someone appended a newer closed at the end: the end wins\n"
+                "  'top-old-end-closed': ('# log\\nStatus %s: running - a\\n' % st(-5 * H) + pad\n"
+                "                         + 'Status %s: closed - window closed\\n' % st(-60), 'closed'),\n"
                 "  # appended layout whose first line sits inside section 1, not above it, and whose last time was\n"
                 "  # written ahead of the clock (not read from `date`): position wins, the times do not\n"
-                "  'end-ahead': ('# log\\n\\n## 1 · 开工\\n- a\\n【状态 柏林 %s】跑着 · 读数\\n- x\\n【状态 柏林 %s】已交 · 交审\\n'\n"
-                "                % (time.strftime('%H:%M', time.localtime(t - 3 * H)), time.strftime('%H:%M', time.localtime(t + 40 * 60))), '已交'),\n"
-                "  # a really stalled session: top line 跑着, nothing newer anywhere\n"
-                "  'top-running': ('# log\\n【状态 柏林 %s】跑着 · 训练中\\n' % st(-5 * H) + pad, '跑着'),\n"
+                "  'end-ahead': ('# log\\n\\n## 1 · start\\n- a\\nStatus %s: running - reading numbers\\n- x\\nStatus %s: done - sent for review\\n'\n"
+                "                % (time.strftime('%H:%M', time.localtime(t - 3 * H)), time.strftime('%H:%M', time.localtime(t + 40 * 60))), 'done'),\n"
+                "  # a really stalled session: top line running, nothing newer anywhere\n"
+                "  'top-running': ('# log\\nStatus %s: running - training\\n' % st(-5 * H) + pad, 'running'),\n"
                 "}\n"
                 "words, sess = {}, {}\n"
                 "for name, (text, _) in cases.items():\n"
@@ -2527,22 +2527,33 @@ def t_stall_last_line(E):
                 "    lp, line = m.status_line(base, name, pc)\n"
                 "    words[name] = m.status_word(line)\n"
                 "    sess[name] = {'alive': True, 'name': name, 'status_line': line, 'status_changed_at': t - 5 * H}\n"
-                "wc = {'stall_words': ['跑着'], 'stall_h': 2}\n"
+                "wc = {'stall_words': ['running'], 'stall_h': 2}\n"
                 "stalled = sorted(x['name'] for x in m.stalled_sessions({'sessions': sess}, wc, t))\n"
-                "print('RESULT', json.dumps({'words': words, 'want': {k: v[1] for k, v in cases.items()}, 'stalled': stalled},\n"
+                "zh = json.load(open(sys.argv[3], encoding='utf-8'))['watch']\n"
+                "zh_lines = {'\u3010\u72b6\u6001 %s\u3011\u8dd1\u7740 \u00b7 a' % st(-5 * H): '\u8dd1\u7740',\n"
+                "            '\u3010\u72b6\u6001 %s\u3011\u7b49\u4eba \u00b7 b' % st(-5 * H): '\u7b49\u4eba'}\n"
+                "zh_words = [m.status_word(l, zh['status_word_regex']) for l in zh_lines]\n"
+                "zh_ok = zh_words == list(zh_lines.values()) and m.status_word('Status: running', zh['status_word_regex']) is None\n"
+                "zh_sess = {'zh%d' % k: {'alive': True, 'name': 'zh%d' % k, 'status_line': l, 'status_changed_at': t - 5 * H} for k, l in enumerate(zh_lines)}\n"
+                "zh_wc = m.watch_config({'watch': zh}, 32 << 30)\n"
+                "zh_stalled = sorted(x['name'] for x in m.stalled_sessions({'sessions': zh_sess}, zh_wc, t))\n"
+                "print('RESULT', json.dumps({'words': words, 'want': {k: v[1] for k, v in cases.items()}, 'stalled': stalled,\n"
+                "                           'zh': [zh_ok, zh_words, zh_stalled]},\n"
                 "                           ensure_ascii=False))\n")
-    r = subprocess.run([PY, probe, E.tool, E.path("proj")], env=E.env, capture_output=True, text=True, timeout=60)
+    r = subprocess.run([PY, probe, E.tool, E.path("proj"),
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples", "status-words-zh.json")], env=E.env, capture_output=True, text=True, timeout=60)
     try:
         res = json.loads(r.stdout.split("RESULT", 1)[1])
     except (IndexError, ValueError):
-        res = {"words": {}, "want": {"?": "?"}, "stalled": None}
+        res = {"words": {}, "want": {"?": "?"}, "stalled": None, "zh": None}
     bad = {k: (res["words"].get(k), v) for k, v in res["want"].items() if res["words"].get(k) != v}
     check("status line: the current line is the newer of the top line and the last one (top edited in "
           "place, older lines inserted below; big and small logs; the usual appended layout unchanged)",
           r.returncode == 0 and not bad, (bad, r.stderr[-300:]))
-    check("stalled: only the session whose current line is still 跑着; 等指挥 / 已交 / 等 Yi / 已关 are not",
+    check("stalled: only the session whose current line is still running; waiting / done / blocked / closed are not",
           res["stalled"] == ["top-running"], res["stalled"])
-
+    check("status words: examples/status-words-zh.json reads its own words (and not the English default), "
+          "and only its stall word is reported", res.get("zh") and res["zh"][0] and res["zh"][2] == ["zh0"], res.get("zh"))
 
 
 # ------------------------------------------------------------ watch crashes leave evidence

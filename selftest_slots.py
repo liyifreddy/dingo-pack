@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""R1 (Yi 16:20): heavy slots not fixed at 6 -- memory and CPU decide. Bad inputs on a fake machine.
+"""R1: heavy slots not fixed at 6 -- memory and CPU decide. Bad inputs on a fake machine.
   python3 test_dynamic.py TOOL
 """
 import json, os, subprocess, sys, tempfile, time

@@ -83,6 +83,13 @@ cases13 = [  # (command, expected with enforcement, cwd)
  (f"cd {LOCAL} && cp -a {NET}/big copy", "deny", NET),                 # E20 ... but an absolute /mnt source still counts
  (f"(cd {LOCAL}) && cp -a big copy", "deny", NET),                     # E21 a subshell's cd does not leak
  (f"bash -c 'cd {LOCAL} && cp -a x y'", "silent", NET),                # E22 cd inside bash -c
+ ('x="$(python3 eval_policy.py)"', "deny", LOCAL),                     # E23 $(...) inside double quotes (was allowed)
+ ('echo "`python3 run_all.py`"', "deny", LOCAL),                       # E24 `...` inside double quotes (was allowed)
+ ("echo 'python3 train.py' | bash", "deny", LOCAL),                    # E25 echoed script piped to a shell (was allowed)
+ ("printf 'pytest -q\\n' | sh -e", "deny", LOCAL),                     # E26
+ ("echo 'ls -la' | bash", "silent", LOCAL),                            # E27 a light echoed script stays allowed
+ ("echo $((a<<b))\npython3 train.py\nb", "deny", LOCAL),               # E28 a shift is not a here-document (was allowed)
+ ('echo "$(date) python3 train.py"', "silent", LOCAL),                 # E29 quoted text around a light $(...) is data
 ]
 env13 = dict(os.environ, DINGO_ENFORCE="1", DINGO_HOME=os.path.join(BASE, "dh"), DINGO_FAKE_MOUNTS=mounts)
 for cmd, want, cwd in cases13:

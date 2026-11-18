@@ -53,7 +53,7 @@ lock. A job that fits may go ahead of one waiting for memory, at most 3 times
 Board (0.3): `board [--json] [--html PATH] [--watch S] [--stale-h H]`. Per session: name,
 state (self-report or guessed), box (`box\d+` in the status line), expected finish, flags,
 last activity, start time, status line. The write time of a status line is the first time
-within 20 characters after 状态 (e.g. `状态（10-05 14:30 柏林）`, `【状态 柏林 18:06】`;
+within 20 characters after `Status` or 状态 (e.g. `Status 11-18 14:05: running`, `【状态 柏林 18:06】`;
 `19:3x` = 19:30); otherwise when dingo-pack first saw it. The expected finish is the first
 time within 40 characters after 预计 / 约 … 完 / ETA / 跑完 / 完成于 (a `＝柏林 HH:MM` there
 wins), or `HH:MM 前`; earlier than the write time means the next day. "ask now": expected
@@ -190,7 +190,8 @@ keyed by the project's absolute path:
 
 - Session name: a name you gave the session (`/rename`) wins; else the first match of
   `name_regex` in its first message; else Claude Code's automatic name.
-- Status line: the last line matching `status_regex` in the newest file matching
+- Status line: the last line matching `status_regex` (default `^\s*Status\b`, anchored at the
+  start of the line so a quoted status line inside the text does not count) in the newest file matching
   `log_glob` (`{name}` = session name; relative to the session's cwd; the directory part may be a
   pattern too, for logs kept per team outside the repo: `../team-notes/*/logs/*_{name}.md`).
 
@@ -252,13 +253,21 @@ keys also as `DINGO_WATCH_<KEY>`.
 Stalled status lines: every `stall_every` (300 s; 0 = off, off by default under `DINGO_SCOPE_TAG`)
 watch refreshes the roster the way `board` does (status lines from each session's log, per
 project `log_glob` / `status_regex`; bounded to 30 s, so a hung mount cannot stop the guard). A
-live session whose line `【状态 …】<word> · …` says one of `stall_words` (default `["跑着"]`) and
+live session whose line says one of `stall_words` (default `["running"]`) and
 has not changed for `stall_h` hours (default 2; since the earlier of when dingo saw the line change
 and the line's own time) gives a `status-stalled` event (once per line, again every `stall_h`),
 a `stalled` list in `status.json`, a `stalled:` line in `who` (while watch runs) and in `board`
-(computed there, also without watch) and a `stalled N h` flag on the board row. 已交 / 已关 /
-等 Yi / 等指挥 / 卡住 and ended sessions are not reported. `DINGO_WATCH_STALL_H`,
-`DINGO_WATCH_STALL_EVERY`.
+(computed there, also without watch) and a `stalled N h` flag on the board row. Other words and
+ended sessions are not reported. `DINGO_WATCH_STALL_H`, `DINGO_WATCH_STALL_EVERY`.
+
+Status words: the word is the first group of `status_word_regex`. The default reads
+`Status: <word> - ...` (also `Status 11-18 14:05: <word>`, `**Status:** <word>`) and the words are
+`running` (working; the only default stall word), `waiting` (needs someone else), `blocked`
+(cannot go on), `done` (handed in) and `closed` (session over). Plain English verbs anyone can
+type, no names; only `running` is checked because the other states either already ask for a
+person or are finished. A log written in another convention sets both keys, e.g.
+`examples/status-words-zh.json` for `【状态 MM-DD HH:MM】跑着 · …`. `stall_words` and
+`stuck_net_wchan` take a list; a single string is one item.
 
 Kernel-stuck (processes in state D): a process is reported only after it has stayed in D for
 `stuck_secs` (default 30; `DINGO_WATCH_STUCK_SECS`). A D whose wchan starts with one of
@@ -305,7 +314,7 @@ python3 selftest_dingo_pack.py --base /some/local/dir     # ~40 s
 python3 selftest_dingo_pack.py --mutants                  # each mutant must turn a check red
 python3 selftest_hook.py && python3 selftest_slots.py && python3 selftest_watch.py
 python3 selftest_watch_control.py                          # watch signal safety / resume state (simulated pids)
-python3 selftest_stall.py                                  # stalled 跑着 status lines in watch / who / board
+python3 selftest_stall.py                                  # stalled `running` status lines in watch / who / board
 ```
 
 Memory tests never stress the real machine: they run against a simulated one — a

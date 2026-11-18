@@ -60,7 +60,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -1324,8 +1324,9 @@ def status_line(cwd, name, pcfg, listing=None):
 
     `listing` caches directory listings for one roster build: the logs may sit on a slow
     network / 9p mount, so each directory is listed once, not once per session."""
-    lg, rx = pcfg.get("log_glob"), pcfg.get("status_regex")
-    if not lg or not rx or not name:
+    lg = pcfg.get("log_glob")
+    rx = pcfg.get("status_regex") or DEFAULT_STATUS_REGEX
+    if not lg or not name:
         return None, None
     rel = lg.replace("{date}", "*")
     d, base = os.path.split(os.path.join(cwd, rel))
@@ -2466,7 +2467,7 @@ def cmd_unstow(args):
 # ---------------------------------------------------------------- board (0.3, minimal)
 
 BOX_RE = re.compile(r"(?i)\bbox\s?(\d+)\b")
-STAMP_RE = re.compile(r"状态[^\d]{0,20}(?:(\d{1,2})-(\d{1,2})\s*)?[^\d]{0,6}(\d{1,2}):(\d{2}|\dx)")  # when it was written
+STAMP_RE = re.compile(r"(?:状态|(?i:\bstatus\b))[^\d]{0,20}(?:(\d{1,2})-(\d{1,2})\s*)?[^\d]{0,6}(\d{1,2}):(\d{2}|\dx)")  # when it was written
 DATED_T = re.compile(r"(\d{1,2})-(\d{1,2})\s*(?:约\s*)?(\d{1,2}):(\d{2}|\dx)")
 # An expected finish needs a word that says so: "预计 / 约 … 完 / ETA / 跑完" and a time
 # within a short window after it; inside that window a Berlin time ("＝柏林 HH:MM") wins.
@@ -2567,35 +2568,47 @@ def stamp_ahead(line, seen):
     return int(ahead) if ahead > 10 else None
 
 
-STATUS_WORD_RE = re.compile(r"【\s*状态[^】]*】\s*([^\s·:：,，。;；|]+)")
+# Default status line and state words: 'Status: running - training step 3' (also 'Status 14:05: waiting',
+# '**Status:** blocked'). The words are running / waiting / blocked / done / closed; only `running`
+# is checked for a stall: waiting and blocked are already asking for someone, done / closed are over.
+# Logs written in another convention set watch.status_word_regex (first group = the word) and
+# watch.stall_words; examples/status-words-zh.json is one.
+DEFAULT_STATUS_REGEX = r"^\s*(?:[>*_#]+\s*)*Status\b"
+DEFAULT_STATUS_WORD_REGEX = r"(?i)^\s*(?:[>*_#]+\s*)*Status\b[^\n]{0,40}?:(?!\d)\s*(?:[*_]+\s*)?([a-z][\w-]*)"
+DEFAULT_STALL_WORDS = ["running"]
 
 
-def status_word(line):
-    """The state word of a status line '【状态 柏林 HH:MM】跑着 · …' (跑着 / 等指挥 / 等 Yi / 已交 / 卡住 …), or None."""
-    m = STATUS_WORD_RE.search(line or "")
+def status_word(line, rx=None):
+    """The state word of a status line ('Status: running - ...' -> 'running'), or None.
+
+    `rx` is watch.status_word_regex (default DEFAULT_STATUS_WORD_REGEX); its first group is the word
+    (the whole match if it has no group). Inner whitespace is collapsed, case is kept."""
+    try:
+        r = re.compile(rx or DEFAULT_STATUS_WORD_REGEX)
+    except re.error:
+        return None
+    m = r.search(line or "")
     if not m:
         return None
-    w = m.group(1)
-    if w == "等" and re.match(r"\s*Yi\b", (line or "")[m.end():]):
-        return "等 Yi"
-    return w
+    w = m.group(1) if r.groups else m.group(0)
+    return " ".join((w or "").split()) or None
 
 
 def stalled_sessions(r, wc, t=None):
-    """Live sessions whose status line says one of wc['stall_words'] (default 跑着) and has not changed for
+    """Live sessions whose status line says one of wc['stall_words'] (default running) and has not changed for
     wc['stall_h'] hours: since the earlier of when dingo saw the line change and the line's own time."""
     t = now() if t is None else t
     out = []
     for sid, s in (r.get("sessions") or {}).items():
         line = s.get("status_line")
-        if not s.get("alive") or not line or status_word(line) not in wc["stall_words"]:
+        if not s.get("alive") or not line or status_word(line, wc.get("status_word_regex")) not in wc["stall_words"]:
             continue
         changed = s.get("status_changed_at") or s.get("last_seen") or t
         _, _, written = parse_status(line, changed)
         since = min(changed, written) if written else changed
         if t - since > wc["stall_h"] * 3600:
             out.append({"sid": sid[:8], "name": s.get("name") or sid[:8], "since": since, "hours": round((t - since) / 3600, 1),
-                        "word": status_word(line), "log": s.get("log"), "line": line[:160]})
+                        "word": status_word(line, wc.get("status_word_regex")), "log": s.get("log"), "line": line[:160]})
     return sorted(out, key=lambda x: x["since"])
 
 
@@ -2624,7 +2637,7 @@ def board_rows(r, stale_h):
                 and t - s["status_changed_at"] > stale_h * 3600 and st != "done":
             flags.append("may have stopped")
         if s["sid"][:8] in stalled:
-            flags.append(f"stalled {stalled[s['sid'][:8]]['hours']:g} h")      # 跑着 but the line has not moved
+            flags.append(f"stalled {stalled[s['sid'][:8]]['hours']:g} h")      # a stall word but the line has not moved
         ahead = stamp_ahead(s.get("status_line"), s.get("status_changed_at"))
         if s.get("alive") and ahead:
             flags.append(f"time {ahead} min ahead")         # the line's own time is later than when it was written
@@ -4460,6 +4473,15 @@ def size_or_pct(v, total):
     return parse_size(s)
 
 
+def as_list(v):
+    """A config value meant as a list: a single string is one item, not its characters."""
+    if v is None or v == "":
+        return []
+    if isinstance(v, str):
+        return [v]
+    return [x for x in v if x not in (None, "")]
+
+
 def watch_config(cfg=None, total=None):
     cfg = cfg if cfg is not None else config()
     w = dict(cfg.get("watch") or {})
@@ -4489,7 +4511,8 @@ def watch_config(cfg=None, total=None):
         # hours is reported; checked every stall_every seconds (0 = off; off by default in scoped tests)
         "stall_h": float(w.get("stall_h", 2)),
         "stall_every": float(w.get("stall_every", 0 if os.environ.get("DINGO_SCOPE_TAG") else 300)),
-        "stall_words": list(w.get("stall_words") or ["跑着"]),
+        "stall_words": as_list(w.get("stall_words")) or list(DEFAULT_STALL_WORDS),
+        "status_word_regex": str(w.get("status_word_regex") or DEFAULT_STATUS_WORD_REGEX),
         "alert_every": float(w.get("alert_every", 120)),
         # kernel-stuck is reported only once a process has stayed in state D this long. A short D is
         # normal I/O (over three days, 13 425 of 13 831 reports were "D 0 s"); the one real hang
@@ -4499,7 +4522,7 @@ def watch_config(cfg=None, total=None):
         # D on a network / 9p disk (e.g. git on a Windows drive under WSL): counted in status.json and
         # alerted only past the much longer stuck_net_secs - a slow share is not a stuck kernel, but a
         # share that has stopped answering for ten minutes is. Matched as wchan prefixes.
-        "stuck_net_wchan": list(w.get("stuck_net_wchan") or STUCK_NET_WCHAN),
+        "stuck_net_wchan": as_list(w.get("stuck_net_wchan")) or list(STUCK_NET_WCHAN),
         "stuck_net_secs": float(w.get("stuck_net_secs", 600)),
         # More than stuck_heavy processes in D: the kernel is jammed and every /proc read adds to it.
         # Then a scan reads only `stat` for them (no syscall / wchan / fds) and walks the ancestors of
@@ -4897,15 +4920,21 @@ class Watcher:
             else:
                 sess, _, _, tag = self.attribute(pid, table, p["start"], own_env=False)
                 walked, wait = walked + 1, False
+            if self.scope and tag is None and not wait:
+                # stat-only attribution has no tag; a scoped (self-test) watch reads just that one
+                # variable, bounded, so its own D processes are not all skipped
+                tag = proc_environ(pid, (b"DINGO_SCOPE_TAG",), timeout=1.0).get("DINGO_SCOPE_TAG")
             if self.scope and tag != self.scope:
                 continue
             pending += wait
             stuck[pid] = {"pid": pid, "comm": p["comm"], "ppid": ppid, "rss": rss, "session": sess, "tag": tag,
                           "pending": wait, "since": prev.get("since") or t, "start": p["start"],
                           "syscall": prev.get("syscall", ""), "wchan": prev.get("wchan", ""),
-                          "fds": prev.get("fds", []), "kill_pending": prev.get("kill_pending")}
+                          "fds": prev.get("fds", []), "kill_pending": prev.get("kill_pending"),
+                          "detailed": prev.get("detailed", False)}
         for pid, b in stuck.items():
-            if b["since"] == t and not heavy:   # first seen: the expensive details, once
+            if not heavy and not b["detailed"]:   # the expensive details, once: when first seen, or
+                b["detailed"] = True               # after a pile-up that skipped them (else a 9p wait counts as local)
                 b["syscall"] = (proc_read(pid, "syscall") or "").strip()
                 b["wchan"] = (proc_read(pid, "wchan") or "").strip()
                 b["fds"] = stuck_fds(pid)
@@ -5256,6 +5285,16 @@ def guard_restart(stale_pid, old_t, timeout=20.0):
     one, then wait for a *fresh* scan before calling it a success. If it cannot be stopped
     (state D, or the lock is held by something else) say so instead of pretending."""
     notes = []
+    rs = read_json(respawn_file(), {}) or {}
+    rpid = rs.get("pid")
+    if rs.get("state") == "respawning" and rpid and pid_alive(int(rpid)) and watch_identity(int(rpid))[0]:
+        # the supervisor is between a watch dying and starting the next one: let it, then look again
+        end = min(float(rs.get("until") or 0) + 10.0, now() + 30.0)
+        while now() < end:
+            pid, wst = watch_running()
+            if pid and float(wst.get("t") or 0) > (old_t or 0):
+                return True, f"its respawn supervisor pid {rpid} restarted it (watch pid {pid})"
+            time.sleep(0.5)
     spid = stop_supervisor()       # else it would start the stopped watch again next to ours
     if spid:
         notes.append(f"stopped its respawn supervisor pid {spid}")
@@ -5480,7 +5519,7 @@ def stop_supervisor():
     """SIGTERM the respawn supervisor (it passes it on to its watch and does not restart). pid or None."""
     rs = read_json(respawn_file(), {}) or {}
     spid = rs.get("pid")
-    if rs.get("state") != "running" or not spid or not pid_alive(int(spid)) or not watch_identity(int(spid))[0]:
+    if rs.get("state") not in ("running", "respawning") or not spid or not pid_alive(int(spid)) or not watch_identity(int(spid))[0]:
         return None
     try:
         os.kill(int(spid), signal.SIGTERM)
@@ -5495,6 +5534,7 @@ def watch_respawn(args):
     a crash-loop event and stop. The guard covers what this cannot see: a watch that hangs without
     dying (it stops it, and this supervisor with it), or this supervisor itself gone."""
     wc = watch_config()
+    fault = watch_fault_log("watch respawn")   # noqa: F841 - kept open for faulthandler
     child = [sys.executable, os.path.abspath(__file__), "watch"] + (["--dry-run"] if args.dry_run else []) + \
             (["--interval", str(args.interval)] if args.interval else [])
     st = {"stop": None, "p": None, "crashes": []}
@@ -5560,6 +5600,7 @@ def watch_respawn(args):
             save("crash-loop", last_rc=rc)
             return 1
         end = now() + wc["respawn_delay"]
+        save("respawning", until=end, last_rc=rc)   # the guard waits this gap out instead of stopping us
         while not st["stop"] and now() < end:
             time.sleep(0.1)
     save("stopped", detail=f"stopped by {st['stop']}")

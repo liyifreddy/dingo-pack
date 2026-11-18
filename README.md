@@ -26,7 +26,7 @@ leader for a dozen coding agents on one machine. Its five core jobs:
 3. **Watching while it runs** — `watch` sees every process of the user, also ones not started
    through dingo: it alerts, pauses (SIGSTOP) the job that would take the machine down, resumes
    it when there is room, kills only at the edge; it also reports a session whose status line
-   says 跑着 (running) and has not moved for 2 h.
+   says `running` and has not moved for 2 h.
 4. **Who is running** — `who` / the roster: sessions, their jobs, memory, status lines.
 5. **After a crash, who was lost** — the roster is saved as you work (`save` / `mark`); `list`
    shows who was lost and `resume --via print` prints the command that continues each.
@@ -63,7 +63,7 @@ One file, Python ≥ 3.8, standard library only. Linux, macOS and WSL.
 
 ## Release and installation demo
 
-Current release: **0.5.3**. Install it from PyPI with pip or pipx:
+Current release: **0.5.4**. Install it from PyPI with pip or pipx:
 
 ```sh
 python3 -m pip install dingo-pack        # or: pipx install dingo-pack
@@ -78,7 +78,7 @@ python3 -m venv .venv-demo && .venv-demo/bin/python -m pip install .
 .venv-demo/bin/dingo-pack run --heavy --threads 1 --mem 64M -- python3 -c 'print("hello")'
 ```
 
-Expected from either: `dingo-pack 0.5.3`; the source demo also prints `hello`
+Expected from either: `dingo-pack 0.5.4`; the source demo also prints `hello`
 (admission may wait). State and locks must live on a local disk; leave `DINGO_HOME`
 at its default, outside a WSL mounted drive. `boxes`, `tokens`, adapter validation
 and task/wait columns are included; `dispatch` and the full three-table crosscheck
@@ -280,8 +280,10 @@ When it crashes, it says so and restarts by itself, up to a point:
   v2 has the memory controller delegated to the user; on WSL2's default cgroup v1 that has no
   effect, so `watch` enforces the cap.
 - Every 5 min it also reads each live session's status line (as `board` does): one that says
-  跑着 and has not changed for 2 h (`"watch": {"stall_h": 2}`) becomes an event and a `stalled:`
-  line in `who` / `board` with the session, how long and the log. 已交 / 已关 / 等 Yi are left alone.
+  `running` and has not changed for 2 h (`"watch": {"stall_h": 2}`) becomes an event and a `stalled:`
+  line in `who` / `board` with the session, how long and the log. `waiting` / `blocked` / `done` /
+  `closed` are left alone. The default line is `Status: running - what it is doing`; other
+  conventions set `status_word_regex` and `stall_words` (see `examples/status-words-zh.json`).
 - A process in kernel state D is reported only after `"watch": {"stuck_secs": 30}` seconds; D on a
   network / 9p disk (wchan prefixes in `"stuck_net_wchan"`) is counted, and alerted only after `"stuck_net_secs"` (600).
 - `dingo-pack who --gate --need 4G` exits 1 when there is no room for a new session or a job is

@@ -1,0 +1,13 @@
+{
+  "_about": "中文状态行示例：【状态 MM-DD HH:MM】跑着 · 在做什么。状态词：跑着 / 等人 / 卡住 / 已交 / 已关；只有「跑着」停太久才报。把 watch 一节并进 ~/.config/dingo-pack/config.json，projects 一节换成你自己的目录。",
+  "projects": {
+    "/path/to/your/project": {
+      "log_glob": "logs/*_{name}.md",
+      "status_regex": "【状态"
+    }
+  },
+  "watch": {
+    "status_word_regex": "【\\s*状态[^】]*】\\s*([^\\s·:：,，。;；|]+)",
+    "stall_words": ["跑着"]
+  }
+}

@@ -21,7 +21,7 @@ dingo-pack resume --midway --via print      # 打印每个的续起命令
 
 1. **重活排名额**：测试、构建、训练、导出排队（`run --heavy`）。
 2. **按内存准入**：申报的峰值放得下（可用 − 已承诺给在跑的 − 余量）才进；CPU 名额 = 核数；不钉死个数。
-3. **跑起来实时盯**：`watch` 看本用户所有进程，没走 dingo 的也看：报警、挂起（SIGSTOP）会把机器拖垮的那件、有余量了放开、到边上才停；状态行写「跑着」却 2 小时没动的会话也报。
+3. **跑起来实时盯**：`watch` 看本用户所有进程，没走 dingo 的也看：报警、挂起（SIGSTOP）会把机器拖垮的那件、有余量了放开、到边上才停；状态行写 `running`（默认状态词）却 2 小时没动的会话也报。
 4. **登记谁在跑**：`who` 和名册：有哪些 session、各自的活、内存、状态行。
 5. **死机后知道丢了谁**：名册边干边存（`save` / `mark`）；`list` 列出丢了谁，`resume --via print` 打印每个的续起命令。双保险：dingo 管这台机器上所有会话，shepherd-dispatch 管它自己起的。
 
@@ -52,7 +52,7 @@ dingo-pack resume --midway                    # 把做到一半的重新打开
 
 ## 版本与安装演示
 
-当前发布版本 **0.5.3**，可用 pip 或 pipx 从 PyPI 安装：
+当前发布版本 **0.5.4**，可用 pip 或 pipx 从 PyPI 安装：
 
 ```sh
 python3 -m pip install dingo-pack        # 或：pipx install dingo-pack
@@ -67,7 +67,7 @@ python3 -m venv .venv-demo && .venv-demo/bin/python -m pip install .
 .venv-demo/bin/dingo-pack run --heavy --threads 1 --mem 64M -- python3 -c 'print("hello")'
 ```
 
-两条路预期都打 `dingo-pack 0.5.3`；源码那条还会打 `hello`，资源准入可能需要排队。
+两条路预期都打 `dingo-pack 0.5.4`；源码那条还会打 `hello`，资源准入可能需要排队。
 状态与锁放本地盘，`DINGO_HOME` 保持默认，不放 WSL 挂载盘。已含 `boxes`、`tokens`、
 适配器校验及任务与等待列；`watch`、`dispatch` 和完整三表 crosscheck 仍是设计。
 见 [CHANGELOG](CHANGELOG.md) 与 [发布步骤](RELEASING.md)。
@@ -189,7 +189,7 @@ watch 崩了会留下记录，自己重起，连着崩就停：
 - 整机可用内存低于 warn（默认 max(4 GB, 15 %)）或某个进程 60 秒涨了 2 GB 以上 → 先报警（`watch/events.jsonl`、dingo 日志、`who`）；低于 stop（max(2.5 GB, 8 %)）→ 挂起（SIGSTOP）涨得最快的、否则最大的那件，不丢活，有余量了自动 SIGCONT 接着跑（每件最多自动两次，跨挂起周期、跨 watch 重启都算；之后等 `watch resume`；每次发信号前逐个进程重核启动时间和属主，PID 被复用了不会误伤）；低于 kill（max(1.2 GB, 4 %)）→ 停掉最大的那件，事件里写清停了谁、为什么、怎么接着跑。会话超了 `session --max` → 挂起这个会话里最大的那件，不自动放。
 - agent 进程本身、shell、tmux、systemd 永远不动；不属于任何会话的进程默认只报警（`"watch": {"unowned": "stop"}` 才动）。阈值都可配：`"watch": {"warn", "stop", "kill", "interval", "grow_warn", ...}` 或 `DINGO_WATCH_WARN` 等。开销：160 个进程，单核约 0.5 %，常驻 30 MB。
 - `session --max`：cgroup v2 且内存控制器委派给用户时，用 `systemd-run --user --scope -p MemoryMax=…` 交给内核硬限；WSL2 默认是 cgroup v1，那里 `MemoryMax` 不生效，改由 `watch` 执行。
-- 每 5 分钟还照 `board` 的读法读一遍各会话日志末尾的状态行：状态词是「跑着」、2 小时（`"watch": {"stall_h": 2}`）没变的，写进 watch 事件，`who` / `board` 里出一行 `stalled:`（哪个会话、停了多久、日志在哪）。「已交 / 已关 / 等 Yi」的不报。
+- 每 5 分钟还照 `board` 的读法读一遍各会话日志末尾的状态行：状态词是 `running`、2 小时（`"watch": {"stall_h": 2}`）没变的，写进 watch 事件，`who` / `board` 里出一行 `stalled:`（哪个会话、停了多久、日志在哪）。`waiting` / `blocked` / `done` / `closed` 的不报。默认状态行写成 `Status: running - 在做什么`；用中文状态行（如「【状态 11-18 14:05】跑着 · …」）的，照 `examples/status-words-zh.json` 在配置里设 `status_word_regex` 和 `stall_words`。
 - 进程卡在内核 D 状态满 `"watch": {"stuck_secs": 30}` 秒才报；D 在网络盘 / 9p 上（wchan 前缀见 `"stuck_net_wchan"`）先只计数，满 `"stuck_net_secs"`（600）秒才报。
 - `dingo-pack who --gate --need 4G`：起新会话前用，余量不够、或有活确实还被 watch 挂着时退出 1。watch 没开着也能 `watch resume`，放开之后 gate 就放行。
 

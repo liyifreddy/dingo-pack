@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""a session whose status line says 跑着 and has not changed for
-stall_h hours (default 2) is reported by watch (event + status), `who` and `board`; 已交 / 已关 /
-等 Yi / a session that has ended are not.
+"""a session whose status line says running (the default stall word) and has not changed for
+stall_h hours (default 2) is reported by watch (event + status), `who` and `board`; done / closed /
+waiting / a session that has ended are not. The project sets only log_glob: the default
+status_regex ('^Status') and status words are what is tested.
 
 Sessions are faked the way selftest_dingo_pack's board test does it: a Claude Code session file per
 `sleep` process (alive), a transcript, and a log with the status line. Private DINGO_HOME and
@@ -27,7 +28,7 @@ def proc_start(pid):
 
 
 def stamp(dt):
-    """A dated Berlin status stamp dt seconds from now (dated, so the test works across midnight)."""
+    """A dated status stamp dt seconds from now (dated, so the test works across midnight)."""
     return time.strftime("%m-%d %H:%M", time.localtime(time.time() + dt))
 
 
@@ -39,17 +40,17 @@ teams = [os.path.join(BASE, "notes", t, "logs") for t in ("team-a", "team-b")]
 for d in [home, os.path.join(ch, "sessions"), os.path.join(ch, "projects", "-proj"), cwd] + teams:
     os.makedirs(d, exist_ok=True)
 cfg = os.path.join(BASE, "config.json")
-json.dump({"projects": {os.path.realpath(cwd): {"log_glob": "../notes/*/logs/*_{name}.md", "status_regex": "【状态"}}},
+json.dump({"projects": {os.path.realpath(cwd): {"log_glob": "../notes/*/logs/*_{name}.md"}}},
           open(cfg, "w"))
 logpath = {}
 H = 3600
 lines = {  # name -> (status line, alive, expected to be reported)
-    "S1-1104-running-old": (f"【状态 柏林 {stamp(-2.5 * H)}】跑着 · 跑训练", True, True),
-    "S2-1104-handed-in": (f"【状态 柏林 {stamp(-3 * H)}】已交 · 交付稿在 x", True, False),
-    "S3-1104-wait-yi": (f"【状态 柏林 {stamp(-3 * H)}】等 Yi · 要定 y", True, False),
-    "S4-1104-closed": (f"【状态 柏林 {stamp(-3 * H)}】已关 · 收工", True, False),
-    "S5-1104-running-fresh": (f"【状态 柏林 {stamp(-600)}】跑着 · 刚起", True, False),
-    "S6-1104-running-dead": (f"【状态 柏林 {stamp(-3 * H)}】跑着 · 会话已经没了", False, False),
+    "S1-1104-running-old": (f"Status {stamp(-2.5 * H)}: running - training", True, True),
+    "S2-1104-handed-in": (f"Status {stamp(-3 * H)}: done - report in x", True, False),
+    "S3-1104-waiting": (f"**Status {stamp(-3 * H)}:** waiting - needs a decision on y", True, False),
+    "S4-1104-closed": (f"Status {stamp(-3 * H)}: closed - wrapped up", True, False),
+    "S5-1104-running-fresh": (f"Status {stamp(-600)}: running - just started", True, False),
+    "S6-1104-running-dead": (f"Status {stamp(-3 * H)}: running - session is gone", False, False),
 }
 procs = []
 for k, (name, (line, alive, _)) in enumerate(lines.items()):
@@ -63,7 +64,7 @@ for k, (name, (line, alive, _)) in enumerate(lines.items()):
         f.write(json.dumps({"type": "user", "message": {"content": name}}) + "\n")
     logpath[name] = os.path.join(teams[k % 2], f"2000-01-02_{name}.md")
     with open(logpath[name], "w") as f:
-        f.write(f"# log\n- 做了点事\n\n{line}\n")
+        f.write(f"# log\n- did a thing\n\n{line}\n")
 for p, (line, alive, _) in zip(procs, lines.values()):
     if not alive:
         p.kill()
@@ -89,8 +90,8 @@ try:
     ev = [json.loads(l) for l in open(evp)] if os.path.exists(evp) else []
     st = [e for e in ev if e["kind"] == "status-stalled"]
     got = sorted(e.get("session") for e in st)
-    check("S1 watch: a live session saying 跑着, unchanged 2.5 h > 2 h -> status-stalled event", "S1-1104-running-old" in got, got)
-    check("S2 watch: 已交 / 等 Yi / 已关, a fresh 跑着 and an ended session are not reported", got == want, got)
+    check("S1 watch: a live session saying running, unchanged 2.5 h > 2 h -> status-stalled event", "S1-1104-running-old" in got, got)
+    check("S2 watch: done / waiting / closed, a fresh running and an ended session are not reported", got == want, got)
     e1 = st[0] if st else {}
     check("S3 the event says which session, how long, and where the log is",
           e1.get("hours", 0) >= 2.4 and str(e1.get("log", "")).endswith("_S1-1104-running-old.md")
@@ -111,14 +112,14 @@ try:
           brd[-500:] + str({n: b["flags"] for n, b in rows.items()}))
     w.send_signal(signal.SIGTERM)
     w.wait(timeout=10)
-    # N is configurable: with stall_h = 5 min the fresh 跑着 (10 min) is reported too
+    # N is configurable: with stall_h = 5 min the fresh running (10 min) is reported too
     brd = subprocess.run([sys.executable, TOOL, "board"], env=dict(env, DINGO_WATCH_STALL_H="0.08"),
                          capture_output=True, text=True).stdout
-    check("S8 stall_h is configurable (DINGO_WATCH_STALL_H=0.08 -> the 10-minute-old 跑着 counts too)",
+    check("S8 stall_h is configurable (DINGO_WATCH_STALL_H=0.08 -> the 10-minute-old running counts too)",
           "stalled: S5-1104-running-fresh" in brd and "stalled: S1-1104-running-old" in brd, brd[-500:])
     # a status line that changes resets the clock
     with open(logpath["S1-1104-running-old"], "a") as f:
-        f.write(f"\n【状态 柏林 {stamp(0)}】跑着 · 换了一步\n")
+        f.write(f"\nStatus {stamp(0)}: running - next step\n")
     brd = subprocess.run([sys.executable, TOOL, "board"], env=env, capture_output=True, text=True).stdout
     check("S9 the line moves on -> no longer reported", "stalled: S1" not in brd, brd[-400:])
 finally:

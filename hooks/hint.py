@@ -218,6 +218,7 @@ def rules():
 OPS = {"&&", "||", ";", "|", "&", ";;", "|&", "(", ")"}
 SUBST_OPEN = ("<(", ">(")          # process substitution; `$(` arrives as "$" then "("
 HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2")
+ARITH = re.compile(r"\$?\(\((?:[^()]|\([^()]*\))*\)\)")      # $((a<<b)) / ((x<<=1)): a shift, not a here-document
 # Commands that only read and print: whatever file names follow them (selftest_x.py, train.py) are
 # data, so such a segment is never heavy. git counts only with a read-only subcommand.
 READ_ONLY = {"cat", "head", "tail", "less", "more", "wc", "nl", "od", "xxd", "hexdump", "strings",
@@ -328,11 +329,51 @@ def strip_heredocs(cmd):
                 out.append(line)
             continue
         out.append(line)
-        for m in HEREDOC.finditer(line):
+        scan = ARITH.sub(lambda a: " " * len(a.group()), line)
+        for m in HEREDOC.finditer(scan):
             owner = strip_prefix(re.split(r"[;&|()]", line[:m.start()])[-1].split())
             keep = reads_stdin_script(owner) or piped_to_shell(line[m.end():])
             pending.append((m.group(3), bool(m.group(1)), keep))
     return "\n".join(out)
+
+
+def lift_quoted_substitutions(text):
+    """`"$(python3 x.py)"` runs x.py although it sits in double quotes; shlex would keep it as one
+    quoted word. Close the quotes around each `$(...)` inside double quotes so it is split like an
+    unquoted one: `x="a $(cmd) b"` -> `x="a "$(cmd)" b"`. Single quotes and `$((...))` are left alone."""
+    if "$(" not in text:
+        return text
+    out, i, n, dq = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if c == "'" and not dq:
+            j = text.find("'", i + 1)
+            j = n - 1 if j < 0 else j
+            out.append(text[i:j + 1])
+            i = j + 1
+            continue
+        if c == '"':
+            dq = not dq
+        elif dq and text.startswith("$(", i) and not text.startswith("$((", i):
+            depth, j = 0, i + 1
+            while j < n:
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            out.append('"' + text[i:j + 1] + '"')
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def segments(cmd, with_ops=False):
@@ -342,6 +383,7 @@ def segments(cmd, with_ops=False):
     import shlex
     try:
         text = re.sub(r"`([^`]*)`", r"$(\1)", strip_heredocs(cmd))     # `...` is the old spelling of $(...)
+        text = lift_quoted_substitutions(text)
         lx = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=True)
         lx.whitespace_split = True
         toks = list(lx)
@@ -497,7 +539,16 @@ def flatten(cmd, cwd, depth=0):
     """Simple commands of `cmd` (wrappers opened up) and, for each, the directory it runs in: a
     `cd DIR` moves the following commands of the same list; a subshell `( ... )` does not leak its cd."""
     segs, cwds, stack, here = [], [], [], cwd
-    for w, op in segments(cmd, with_ops=True):
+    parts = segments(cmd, with_ops=True)
+    for k, (w, op) in enumerate(parts):
+        # `echo 'python3 train.py' | bash`: the words echoed are the script the shell runs
+        e = strip_prefix(w[1:] if w and w[0] == "(" else w)
+        if op == "|" and e and os.path.basename(e[0]) in ("echo", "printf") and k + 1 < len(parts) \
+                and reads_stdin_script(strip_prefix(parts[k + 1][0])) and depth < 4:
+            text = " ".join(a for a in e[1:] if not (a.startswith("-") and len(a) <= 3))
+            inner, dirs = flatten(text.replace("\\n", "\n"), here, depth + 1)
+            segs += inner
+            cwds += dirs
         if w and w[0] == "(":
             w = w[1:]
         s = strip_prefix(w)
