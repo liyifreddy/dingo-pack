@@ -2541,7 +2541,7 @@ def t_stall_last_line(E):
                 "                           'zh': [zh_ok, zh_words, zh_stalled]},\n"
                 "                           ensure_ascii=False))\n")
     r = subprocess.run([PY, probe, E.tool, E.path("proj"),
-                        os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples", "status-words-zh.json")], env=E.env, capture_output=True, text=True, timeout=60)
+                        os.path.join(HERE, "examples", "status-words-zh.json")], env=E.env, capture_output=True, text=True, timeout=60)
     try:
         res = json.loads(r.stdout.split("RESULT", 1)[1])
     except (IndexError, ValueError):

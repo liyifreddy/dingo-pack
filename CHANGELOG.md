@@ -1,6 +1,10 @@
 # 更新记录 / Changelog
 
-## 0.5.4 · candidate
+## 0.5.5 · 2026-11-18
+
+- **Self-test passes on Python 3.8 again:** `t_stall_last_line` resolved the examples path from a relative `__file__` after an earlier test left the working directory deleted; it now uses the path taken at import.
+
+## 0.5.4 · 2026-11-18
 
 - **Default status words are plain English, with no names.** The status line defaults to `Status: <word> - ...` (`status_regex` default `^\s*Status\b`, anchored at the line start, so a status line quoted inside the text no longer counts) and the words are `running` / `waiting` / `blocked` / `done` / `closed`; `stall_words` defaults to `["running"]`. The word is read with the new `watch.status_word_regex` (first group). The former built-in Chinese words moved to `examples/status-words-zh.json`; a project that keeps them sets `status_word_regex` and `stall_words` in its config.
 - **`stall_words` / `stuck_net_wchan` written as one string** are one item, not split into characters.
