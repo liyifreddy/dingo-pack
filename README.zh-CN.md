@@ -35,6 +35,8 @@ pipx install git+https://github.com/liyifreddy/dingo-pack
 dingo-pack                                    # 一屏总览：内存、名额、session
 dingo-pack run --heavy --mem 4G -- pytest     # 重活先等名额和空闲内存，再跑
 dingo-pack doctor                             # 这台机器现在哪里不对劲？
+dingo-pack stuck                              # 谁卡在内核里、谁被它拖住
+dingo-pack watch guard --once --every 60      # 挂 cron 每分钟一次：看门狗没了 / 扫描停了就重起
 dingo-pack list                               # 死机之后：哪些 session 丢了
 dingo-pack resume --midway                    # 把做到一半的重新打开
 ```
@@ -50,7 +52,7 @@ dingo-pack resume --midway                    # 把做到一半的重新打开
 
 ## 版本与安装演示
 
-当前发布版本 **0.4.2**，可用 pip 或 pipx 从 PyPI 安装：
+当前发布版本 **0.5.3**，可用 pip 或 pipx 从 PyPI 安装：
 
 ```sh
 python3 -m pip install dingo-pack        # 或：pipx install dingo-pack
@@ -65,14 +67,14 @@ python3 -m venv .venv-demo && .venv-demo/bin/python -m pip install .
 .venv-demo/bin/dingo-pack run --heavy --threads 1 --mem 64M -- python3 -c 'print("hello")'
 ```
 
-两条路预期都打 `dingo-pack 0.4.2`；源码那条还会打 `hello`，资源准入可能需要排队。
+两条路预期都打 `dingo-pack 0.5.3`；源码那条还会打 `hello`，资源准入可能需要排队。
 状态与锁放本地盘，`DINGO_HOME` 保持默认，不放 WSL 挂载盘。已含 `boxes`、`tokens`、
 适配器校验及任务与等待列；`watch`、`dispatch` 和完整三表 crosscheck 仍是设计。
 见 [CHANGELOG](CHANGELOG.md) 与 [发布步骤](RELEASING.md)。
 
 ## 平台与 agent
 
-| 平台 | 支持范围 | 本候选实测（2026-11-04） |
+| 平台 | 支持范围 | 本候选实测 |
 |---|---|---|
 | Linux | POSIX CLI 与 `/proc` 监测 | 已测 WSL Linux 内核；独立原生 Linux 主机没测 |
 | WSL2 | Python 与 CLI 都在 WSL 内运行；状态放 Linux 盘 | 已测完整自测、限内存 CSV、安装冒烟 |
@@ -114,8 +116,10 @@ python3 -m venv .venv-demo && .venv-demo/bin/python -m pip install .
 OOM 的证明；由监督器触发的整树超限则明确标为已确认。普通非零退出保留原因未知，
 还需看子命令的 `MemoryError`、解析器错误或业务错误。
 
-无配置时默认 `--mem 1G`，单进程 `--limit 1.5G`，整树上限相同；
-`default_mem` / `DINGO_DEFAULT_MEM` 可覆盖预估。RLIMIT_DATA/AS 与 RSS 不是同一个量，
+无配置时默认 `--mem 1G`、整树上限 1.5 × `--mem`；单进程 `--limit` 默认不开（`0` = 不设）。
+RLIMIT_DATA / RLIMIT_AS 限的是地址空间、不是 RSS：单是 `import numpy` 就映射约 1.1 GB 而 RSS
+只有约 27 MB，旧的「默认 1.5 × `--mem`」会把只用了申报量几个百分点的正常程序杀掉。默认的
+保护改成按真实内存量（PSS/RSS）采样的整树上限。RLIMIT_DATA/AS 与 RSS 不是同一个量，
 失败的分配或很短的峰值可能采不到。大 CSV 优先分块读取；确需增加内存时先看余量，
 同步调整预估与上限。输入文件大小不能直接换算内存峰值。
 `python3 selftest_release.py --large-csv` 用 670 MiB 合成 CSV 验证限内存失败与流式成功。
@@ -153,7 +157,7 @@ dingo-pack top                                            # 每个 session 用�
 ```
 
 - `--threads N`（默认 8）给这件活设好 `OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 等线程数，并占用 N 个 CPU 名额（全机名额数 = 核数）。负载超过每核 1.5 时，`doctor` 和提示 hook 会报警。
-- `--mem` 填你估计的最高用量。上限默认是它的 1.5 倍；超了只停你这件（单个进程会遇到 MemoryError 自己退出，整棵进程树超了会被停掉、退出码 137），不会拖垮整台机器。
+- `--mem` 填你估计的最高用量。整棵进程树的上限默认是它的 1.5 倍（按真实内存量 PSS/RSS 算）；超了只停你这件、退出码 137，不会拖垮整台机器。单进程上限 `--limit` 默认不开：它限的是地址空间不是 RSS，`import numpy` 就映射约 1.1 GB 而实际只用几十 MB；要硬顶自己程序的地址空间时再显式加，撞上它才会看到 MemoryError。
 - 不是一条 shell 命令的重活（agent 自己的审查、一批子 agent），用租约：`dingo-pack lease --mem 3G --for 45m`，做完 `dingo-pack release`。agent 退出时租约也会自动放掉。
 - **名额不是固定个数**：默认不设上限个数，能放几件由内存和 CPU 定——申报的 `--mem` 放得进「可用 − 已承诺给在跑的 − 余量」就放，放不下就排队；每件按 `--threads` 占 CPU 名额，CPU 名额 = 核数。`who` 会写「现在还能放几件、按什么算的」。要钉死个数：配置 `"slots": N` 或 `DINGO_SLOTS`；余量：`"reserve"` 或 `DINGO_RESERVE`（默认 max(1 GB, 内存的 10 %)）。
 - **慢盘**：能把数据拷到 WSL 本地盘（`~/`、`/tmp`）上跑的，先拷过去跑，结果再写回；非在 `/mnt/…` 上大量读写不可的，走 `run --io`。
@@ -168,14 +172,25 @@ dingo-pack top                                            # 每个 session 用�
 dingo-pack watch --daemon          # 后台常驻（单实例）；dingo-pack watch stop 停
 dingo-pack watch status            # 每个会话用了多少、谁被挂起了、最近的报警
 dingo-pack watch resume 12345      # 接着跑被挂起的那件（或 all）
-dingo-pack session --name 科X --max 8G -- claude ...   # 起一个带名字、带上限的会话
+dingo-pack session --name worker-a --max 8G -- claude ...   # 起一个带名字、带上限的会话
 ```
+
+guard 自己没有上级盯着。建议用 cron 或 systemd 定时器每分钟跑一次，看门狗死了才有人重起：`* * * * * ~/.local/bin/dingo-pack watch guard --once --every 60`。`--every` 要写真实周期：guard 上次检查早于 max(3 × every, 5 分钟) 就显示 STALE，周期正好等于这条线（比如每 5 分钟、不带 `--every`）每到整点都会闪一下 STALE。
+
+watch 崩了会留下记录，自己重起，连着崩就停：
+
+- `watch --daemon` 让 watch 跑在一个小看护进程（`watch --respawn`）底下。watch 一死，看护进程记一条 `watch-crash` 事件，写明退出码和信号（`-11` / `139` 写成 SIGSEGV），2 秒后重起。10 分钟内死满 5 次（`crash_max`、`crash_window`）就记 `crash-loop`，不再重起。guard 也不重起处在 crash loop 的 watch，`who` / `watch status` 里会写出来，等人看完栈后手动 `dingo-pack watch --daemon`。watch 卡住没死、或看护进程没了，归 guard 管。`watch stop` 两个一起停。
+- watch 和 guard 都把 Python 的 faulthandler 写进 `watch/fault.log`，每次启动写一行头（时间、角色、pid）。段错误时各线程的 Python 栈留在这里。文件超过 1 MB 先挪成 `fault.log.1`。
+- 解释器正常时，扫描代码不会抛 TypeError / KeyError / SystemError。一分钟内出两次（`odd_max`、`odd_window`），watch 记 `odd-errors`，以退出码 70 退出，交给看护进程起新的。解释器可能已经写坏了，就不再在里面做挂起 / 停进程的判定。
+- D 状态进程超过 200 个（`stuck_heavy`）时，扫描只读它们的 `stat`，不读 syscall / wchan / fds。每轮最多给 200 个新出现的走祖先链（`stuck_scan_max`），其余的留给后面几轮（`status.json` 的 `stuck_pending`）。
+- guard 因 SIGTERM / SIGINT / SIGHUP 或出错退出时，记一条 `watch-guard-exit` 日志，写明原因，`guard.json` 里也留着（`exited`）。SIGKILL 接不到。
 
 - 每 2 秒看一遍本用户的所有进程，**包括没走 dingo 起的**：按环境里的 `DINGO_SESSION` / `CLAUDE_PID`、否则最近的 agent 祖先进程（claude / codex / opencode / hermes）归到会话。
 - 整机可用内存低于 warn（默认 max(4 GB, 15 %)）或某个进程 60 秒涨了 2 GB 以上 → 先报警（`watch/events.jsonl`、dingo 日志、`who`）；低于 stop（max(2.5 GB, 8 %)）→ 挂起（SIGSTOP）涨得最快的、否则最大的那件，不丢活，有余量了自动 SIGCONT 接着跑（每件最多自动两次，跨挂起周期、跨 watch 重启都算；之后等 `watch resume`；每次发信号前逐个进程重核启动时间和属主，PID 被复用了不会误伤）；低于 kill（max(1.2 GB, 4 %)）→ 停掉最大的那件，事件里写清停了谁、为什么、怎么接着跑。会话超了 `session --max` → 挂起这个会话里最大的那件，不自动放。
-- agent 进程本身、shell、tmux、systemd 永远不动；不属于任何会话的进程默认只报警（`"watch": {"unowned": "stop"}` 才动）。阈值都可配：`"watch": {"warn", "stop", "kill", "interval", "grow_warn", ...}` 或 `DINGO_WATCH_WARN` 等。开销：本机 160 个进程，单核约 0.5 %，常驻 30 MB。
+- agent 进程本身、shell、tmux、systemd 永远不动；不属于任何会话的进程默认只报警（`"watch": {"unowned": "stop"}` 才动）。阈值都可配：`"watch": {"warn", "stop", "kill", "interval", "grow_warn", ...}` 或 `DINGO_WATCH_WARN` 等。开销：160 个进程，单核约 0.5 %，常驻 30 MB。
 - `session --max`：cgroup v2 且内存控制器委派给用户时，用 `systemd-run --user --scope -p MemoryMax=…` 交给内核硬限；WSL2 默认是 cgroup v1，那里 `MemoryMax` 不生效，改由 `watch` 执行。
 - 每 5 分钟还照 `board` 的读法读一遍各会话日志末尾的状态行：状态词是「跑着」、2 小时（`"watch": {"stall_h": 2}`）没变的，写进 watch 事件，`who` / `board` 里出一行 `stalled:`（哪个会话、停了多久、日志在哪）。「已交 / 已关 / 等 Yi」的不报。
+- 进程卡在内核 D 状态满 `"watch": {"stuck_secs": 30}` 秒才报；D 在网络盘 / 9p 上（wchan 前缀见 `"stuck_net_wchan"`）先只计数，满 `"stuck_net_secs"`（600）秒才报。
 - `dingo-pack who --gate --need 4G`：起新会话前用，余量不够、或有活确实还被 watch 挂着时退出 1。watch 没开着也能 `watch resume`，放开之后 gate 就放行。
 
 ## 📋 名册

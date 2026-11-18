@@ -216,6 +216,18 @@ def rules():
     return {"enforce": enforce, "enforce_io": c.get("enforce_io", True), "words": words,
             "extra": extra, "light": light, "small_scan": small}
 OPS = {"&&", "||", ";", "|", "&", ";;", "|&", "(", ")"}
+SUBST_OPEN = ("<(", ">(")          # process substitution; `$(` arrives as "$" then "("
+HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2")
+# Commands that only read and print: whatever file names follow them (selftest_x.py, train.py) are
+# data, so such a segment is never heavy. git counts only with a read-only subcommand.
+READ_ONLY = {"cat", "head", "tail", "less", "more", "wc", "nl", "od", "xxd", "hexdump", "strings",
+             "sha256sum", "sha1sum", "sha512sum", "md5sum", "b2sum", "cksum", "diff", "cmp", "comm",
+             "grep", "egrep", "fgrep", "rg", "ls", "stat", "file", "echo", "printf", "sort", "uniq", "cut",
+             "tr", "column", "jq", "readlink", "realpath", "basename", "dirname", "which", "type"}
+GIT_READ_ONLY = {"show", "diff", "log", "status", "blame", "cat-file", "ls-files", "ls-tree", "rev-parse",
+                 "grep", "shortlog", "describe", "branch", "tag", "worktree", "remote", "config"}
+XARGS_VALUE = {"-n", "-I", "-i", "-L", "-l", "-P", "-s", "-d", "-E", "-e", "-a", "-J", "--max-args",
+               "--max-procs", "--delimiter", "--arg-file", "--max-lines", "--max-chars", "--replace"}
 ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -266,18 +278,96 @@ def status(cmd):
     return info
 
 
+def reads_stdin_script(w):
+    """True for a shell that runs its standard input as a script: `bash`, `sudo sh -e`, `bash -s x`;
+    not `bash -c '...'` and not `bash script.sh` (they read their commands elsewhere)."""
+    if not w or os.path.basename(w[0]) not in SHELLS or shell_command(w) is not None:
+        return False
+    i = 1
+    while i < len(w):
+        a = w[i]
+        if a in ("-s", "--"):
+            return True
+        if a in ("--rcfile", "--init-file", "-o", "+o", "-O", "+O"):
+            i += 2
+            continue
+        if a[:1] in ("-", "+") and len(a) > 1:
+            if "s" in a[1:] and not a.startswith("--"):
+                return True
+            i += 1
+            continue
+        return False                          # a script file: stdin is its data, not its commands
+    return True
+
+
+def piped_to_shell(rest):
+    """True if the pipeline that goes on in `rest` (the line after a here-document marker) hands its
+    data to a shell that runs it: `cat <<EOF | bash`, `cat <<'EOF' | tee x.log | sudo sh`."""
+    parts = re.split(r"(\|\||&&|\||;|&)", rest)
+    for sep, stage in zip(parts[1::2], parts[2::2]):
+        if sep != "|":
+            return False
+        if reads_stdin_script(strip_prefix(stage.split())):
+            return True
+    return False
+
+
+def strip_heredocs(cmd):
+    """Drop here-document bodies: they are a file's text or a script for another program, not
+    commands of this shell. A body fed to a shell (`bash <<EOF`, `sudo sh <<'EOF'`, `cat <<EOF | bash`)
+    is kept."""
+    if "<<" not in cmd:
+        return cmd
+    out, pending = [], []                     # pending: (terminator, strip tabs, keep body)
+    for line in cmd.split("\n"):
+        if pending:
+            word, dash, keep = pending[0]
+            if (line.lstrip("\t") if dash else line) == word:
+                pending.pop(0)
+            elif keep:
+                out.append(line)
+            continue
+        out.append(line)
+        for m in HEREDOC.finditer(line):
+            owner = strip_prefix(re.split(r"[;&|()]", line[:m.start()])[-1].split())
+            keep = reads_stdin_script(owner) or piped_to_shell(line[m.end():])
+            pending.append((m.group(3), bool(m.group(1)), keep))
+    return "\n".join(out)
+
+
 def segments(cmd, with_ops=False):
     """Split a shell command into simple commands (lists of words), honouring quotes. with_ops: pairs
-    (words, operator that ends them)."""
+    (words, operator that ends them). A substitution `$(...)` / `<(...)` / `>(...)` is a command of
+    its own; the words after it still belong to the command it sits in."""
     import shlex
     try:
-        lx = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
+        text = re.sub(r"`([^`]*)`", r"$(\1)", strip_heredocs(cmd))     # `...` is the old spelling of $(...)
+        lx = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=True)
         lx.whitespace_split = True
         toks = list(lx)
     except ValueError:
         toks = cmd.split()
-    out, cur = [], []
+    out, cur, opened = [], [], []             # opened: per "(": the outer words of a substitution, or None
     for t in toks:
+        if t in SUBST_OPEN or (t == "(" and cur and cur[-1].endswith("$")):
+            if t == "(":
+                cur[-1] = cur[-1][:-1]
+                if not cur[-1]:
+                    cur.pop()
+            opened.append(cur)
+            if with_ops:
+                out.append(([], "("))         # flatten: a cd inside does not leak out
+            cur = []
+            continue
+        if t == "(":
+            opened.append(None)
+        elif t == ")" and opened:
+            outer = opened.pop()
+            if outer is not None:
+                if cur or with_ops:
+                    out.append((cur, ")") if with_ops else cur)
+                cur = outer
+                continue
         if t in OPS:
             if cur or with_ops:
                 out.append((cur, t) if with_ops else cur)
@@ -297,6 +387,8 @@ def segment_heavy(w):
     cmd = os.path.basename(w[0])
     if is_wrapped(w):
         return False
+    if cmd in READ_ONLY or (cmd == "git" and any(a in GIT_READ_ONLY for a in w[1:3] if not a.startswith("-"))):
+        return False                                  # git show x:selftest_a.py | sha256sum
     script_args = [a for a in w[1:] if not a.startswith("-")] if (PY.match(cmd) or cmd in SHELLS) else []
     if r["light"] and any(r["light"].search(a) for a in [w[0]] + script_args):
         return False
@@ -376,6 +468,28 @@ def unwrap(w):
             rest = rest[2:] if rest[0] in ("-n", "-p", "--name", "--prefix", "-e", "--env", "--with") and len(rest) > 1 else rest[1:]
         if rest:
             return unwrap(rest)
+    if cmd == "xargs":
+        rest = w[1:]
+        while rest and rest[0].startswith("-"):
+            opt = rest[0]
+            # options that take a value as the next word (`-n 1`, `-I {}`); `-n1` / `--max-args=1` carry it
+            rest = rest[2:] if opt in XARGS_VALUE and len(rest) > 1 else rest[1:]
+            if opt == "--":
+                break
+        if rest:
+            return [w] + unwrap(rest)
+    if cmd == "find":
+        out = [w]
+        for i, a in enumerate(w):
+            if a in ("-exec", "-execdir", "-ok", "-okdir"):
+                inner = []
+                for x in w[i + 1:]:
+                    if x in (";", "+", "\\;"):
+                        break
+                    inner.append(x)
+                if inner:
+                    out += unwrap(inner)
+        return out
     return [w]
 
 

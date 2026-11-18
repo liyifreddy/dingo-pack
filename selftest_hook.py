@@ -5,7 +5,7 @@ BASE = os.environ.get("DINGO_TEST_BASE") or _tf.mkdtemp(prefix="dingo-selftest-"
 H = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks/hint.py"))
 cases = [  # (command, expected: deny / hint / silent)
  ("python run_all.py", "deny"),
- ("cd /mnt/g/Agents/RoboSynChallenge/work && python3 scripts/run_all.py --all", "deny"),
+ ("cd /mnt/g/Projects/robot/work && python3 scripts/run_all.py --all", "deny"),
  ("python3 tools/记录.py --x", "silent"),
  ("ls -la; git status --short -- a.md", "silent"),
  ("pytest -q tests/", "deny"),
@@ -23,10 +23,10 @@ cases = [  # (command, expected: deny / hint / silent)
  ("dingo-pack who; python run_all.py", "deny"),
  ("python3 ~/.local/bin/dingo-pack run --heavy -- pytest", "silent"),
  ("echo 'python run_all.py'", "silent"),
- ("cp -r /mnt/g/Agents/big ~/x", "deny"),
+ ("cp -r /mnt/g/Projects/big ~/x", "deny"),
  ("cp /mnt/g/Work/a.md ~/a.md", "hint"),
- ("grep -rn foo /mnt/g/Agents/RoboSynChallenge", "deny"),
- ("grep -n foo /mnt/g/Work/head-quarter/AGENTS.md", "silent"),
+ ("grep -rn foo /mnt/g", "deny"),
+ ("grep -n foo /mnt/g/Work/notes/AGENTS.md", "silent"),
  ("tar -cf /mnt/g/x.tar ~/data", "deny"),
  ("dingo-pack run --io -- tar -cf /mnt/g/x.tar ~/data", "silent"),
  ("find /mnt/g/Work -maxdepth 1 -name '*.md'", "hint"),
@@ -45,7 +45,7 @@ for enforce in ("1", "0"):
         bad += not ok
         print(("PASS" if ok else "FAIL"), f"enforce={enforce}", f"want={exp:<6} got={got:<6}", cmd)
     # Agent tool never denied
-# 开-013 E: a fake 9p mount (DINGO_FAKE_MOUNTS) so the scan-size and cd rules do not depend on this machine.
+# a fake 9p mount (DINGO_FAKE_MOUNTS) so the scan-size and cd rules do not depend on this machine.
 #   net/one.md (a file), net/small/ (5 files), net/big/ (40 dirs x 20 files = 840 entries)
 NET = os.path.join(BASE, "net")
 os.makedirs(os.path.join(NET, "small"), exist_ok=True)

@@ -1,6 +1,6 @@
 # 发布步骤 / Release procedure
 
-## 本次只读查核 / Read-only finding (2026-11-04)
+## 本次只读查核 / Read-only finding
 
 [run 37317607126](https://github.com/liyifreddy/dingo-pack/actions/runs/37317607126)
 是 v0.1.1 的发布任务，状态为 **waiting**，steps 为空。`gh run view --log-failed`
@@ -27,6 +27,11 @@ No failed upload log exists yet. The environment protection remains enabled.
    本次旧 run 针对 v0.1.1；它不包含本地修复，不能用它发布 0.4.2。
 6. 上传完成后核 PyPI 版本，在干净环境安装精确版本并跑版本与 hello 冒烟。
    若上传失败，再留存该次 `gh run view <id> --log-failed`，按实际 OIDC 错误排查 publisher 字段。
+7. README 两版写着当前版本和安装后应看到的版本号（如「Current release 0.5.3」「Expected: dingo-pack 0.5.3」）。
+   这些只在 PyPI 上已有该版本时成立：带新版本号的 README 和发版同一次推送，或在 PyPI 上传成功之后推，不能先推。
+
+The READMEs name the current release and the version `pip install` should print. Push a README
+that names a new version together with, or after, the PyPI upload of that version - never before.
 
 For PyPI, add an existing or pending GitHub Trusted Publisher with owner `liyifreddy`,
 repository `dingo-pack`, filename `publish.yml`, environment `pypi`. No token is needed.

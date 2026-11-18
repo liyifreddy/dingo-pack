@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""开-013 bad-input checks for watch's signal safety and control state (findings A-D of 开-010).
+"""bad-input checks for watch's signal safety and control state (review findings A-D).
 
 A  every signal re-checks the identity of each recorded process (pid reuse of root / child, other
    owner, now a protected process, reuse between scan and signal)
@@ -86,7 +86,10 @@ class World:
         m.meminfo = lambda: (w.total, w.avail)
         m.proc_table = lambda: {pid: (r["ppid"], r["rss"]) for pid, r in w.p.items()}
         m.proc_start = lambda pid: w.p[int(pid)]["start"] if int(pid) in w.p else None
-        m.proc_info = lambda pid: (w.p[int(pid)]["comm"], w.p[int(pid)]["state"], w.p[int(pid)]["uid"]) if int(pid) in w.p else None
+        m.proc_stat = lambda pid: ({"comm": w.p[int(pid)]["comm"], "state": w.p[int(pid)]["state"],
+                                    "ppid": w.p[int(pid)]["ppid"], "sid": 0, "start": w.p[int(pid)]["start"],
+                                    "rss": w.p[int(pid)]["rss"]} if int(pid) in w.p else None)
+        m.proc_info = lambda pid, pstat=None: (w.p[int(pid)]["comm"], w.p[int(pid)]["state"], w.p[int(pid)]["uid"]) if int(pid) in w.p else None
         m.proc_environ = lambda pid, keys=(): ({"DINGO_SESSION": w.p[int(pid)]["session"]}
                                                if int(pid) in w.p and w.p[int(pid)]["session"] else {})
         m.proc_pss = lambda pid: None
@@ -384,7 +387,7 @@ def test_concurrent():
         if hasattr(mod, "take_resume_requests"):
             mod.take_resume_requests(wt)
             wt.step()
-        else:                                                  # the loop body of the version before 开-013
+        else:                                                  # the loop body of the older version
             note = os.path.join(home, "watch", "resumed.json")
             for pid in mod.read_json(note, []) or []:
                 wt.stopped.pop(int(pid), None)

@@ -21,6 +21,7 @@ Advanced -- slots and memory:
   dingo-pack who                   who holds slots, who is queuing, memory now
   dingo-pack run --io -- CMD...    big reads / writes on a slow disk, in their own lane (1 slot)
   dingo-pack top [--watch S]       memory by session
+  dingo-pack stuck                 who is in state D (kernel-stuck), and what is stuck behind it
   dingo-pack doctor                one checkup: memory, OOM kills, mounts, WSL, slots, roster, ghosts
   dingo-pack ghosts [--reap]       processes whose session is gone (reap: humans only)
   dingo-pack log [-n N]            recent job lines
@@ -59,12 +60,13 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.5.0"
+__version__ = "0.5.3"
 
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_TIMEOUT = 75          # EX_TEMPFAIL: no slot / not enough memory within --timeout
 EXIT_TREE_LIMIT = 137      # the job's process tree went over --tree-limit and was stopped
+EXIT_WATCH_ODD = 70        # EX_SOFTWARE: watch gave up after repeated "impossible" exceptions (see odd_max)
 
 GIB = 1024 ** 3
 MIB = 1024 ** 2
@@ -277,29 +279,136 @@ def meminfo():
 
 
 def proc_table():
-    """{pid: (ppid, rss_bytes)} for all processes."""
+    """{pid: (ppid, rss_bytes)} for all processes from `stat` alone.
+
+    `stat` is the one file in /proc/<pid> that a process stuck in the kernel still lets us read.
+    statm / cmdline / environ / smaps_rollup can block until the kernel releases that process:
+    once, one such python3 (state D, waiting on brk) hung dingo-pack who, top and the
+    watch daemon plus 707 `ps` readers, load 900 on an otherwise idle machine. So: stat first,
+    everything else bounded (see proc_read) and skipped outright for D."
+    """
     table = {}
-    if os.path.isdir("/proc/self"):
+    if os.path.isdir(os.path.join(PROC_ROOT, "self")):
         page = os.sysconf("SC_PAGE_SIZE")
-        for d in os.listdir("/proc"):
+        for d in os.listdir(PROC_ROOT):
             if not d.isdigit():
                 continue
-            try:
-                with open(f"/proc/{d}/stat") as f:
-                    st = f.read()
-                ppid = int(st[st.rindex(")") + 2:].split()[1])
-                with open(f"/proc/{d}/statm") as f:
-                    rss = int(f.read().split()[1]) * page
-                table[int(d)] = (ppid, rss)
-            except (OSError, ValueError, IndexError):
-                continue
+            p = proc_stat(int(d))
+            if p:
+                table[int(d)] = (p["ppid"], p["rss"])
         return table
-    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,rss="], capture_output=True, text=True).stdout
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,rss="], capture_output=True, text=True,
+                             timeout=10).stdout
+    except subprocess.TimeoutExpired:
+        return table
     for line in out.splitlines():
         p = line.split()
         if len(p) == 3:
             table[int(p[0])] = (int(p[1]), int(p[2]) * 1024)
     return table
+
+
+# /proc reading: `stat` always; anything that touches the process's memory (cmdline, environ,
+# smaps_rollup, status, fd targets) only with a deadline, and never for a process in state D.
+# DINGO_FAKE_PROC points the readers at a fake tree for the self-tests.
+PROC_ROOT = os.environ.get("DINGO_FAKE_PROC") or "/proc"
+PROC_READ_TIMEOUT = float(os.environ.get("DINGO_PROC_TIMEOUT", "0.3"))
+STUCK_STATES = ("D", "X")
+# kernel wait points of network file systems (9p = /mnt/* under WSL, NFS, CIFS / SMB, FUSE)
+STUCK_NET_WCHAN = ("p9_", "v9fs_", "nfs", "rpc_wait", "cifs", "smb2", "wait_for_response", "fuse_",
+                   "request_wait_answer")
+
+
+def proc_path(pid, name):
+    return os.path.join(PROC_ROOT, str(int(pid)), name)
+
+
+def proc_stat(pid):
+    """comm, state, ppid, start (clock ticks), rss (bytes) in one read of `stat`, or None."""
+    try:
+        with open(proc_path(pid, "stat")) as f:
+            st = f.read()
+        f = st[st.rindex(")") + 2:].split()
+        return {"comm": st[st.index("(") + 1:st.rindex(")")], "state": f[0], "ppid": int(f[1]),
+                "sid": int(f[3]), "start": int(f[19]), "rss": int(f[21]) * os.sysconf("SC_PAGE_SIZE")}
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
+# Files under /proc/<pid> whose read walks the process's memory: they block until the kernel
+# lets go of a process in state D, and the reader enters D too. Never opened for such a process.
+PROC_MEM_FILES = ("cmdline", "environ", "smaps_rollup", "statm", "status")
+_READ_STUCK = {}        # (pid, file, start) that already timed out -> never retried (a new reader would hang too)
+_READ_DEADLINE = [0.0]  # end of the current scan's optional-read budget (see read_budget)
+READ_STUCK_MAX = int(os.environ.get("DINGO_READ_STUCK_MAX", "512"))   # after this many stuck reads, stop opening more
+
+
+def _prune_read_stuck():
+    """Forget entries whose process is gone or whose pid now names another process. Never drop an
+    entry whose reader may still be blocked in the kernel: dropping it only buys a second reader."""
+    for key in list(_READ_STUCK):
+        pid, _, start = key
+        p = proc_stat(pid)
+        if p is None or (start is not None and p["start"] != start):
+            _READ_STUCK.pop(key, None)
+
+
+class read_budget:
+    """Bound the optional /proc reads of one whole scan: after N seconds everything memory-touching
+    is answered from `stat` instead. Watch has its own; top / ghosts / task lists use this."""
+
+    def __init__(self, seconds=5.0):
+        self.seconds = float(os.environ.get("DINGO_SCAN_READ_BUDGET", seconds))
+
+    def __enter__(self):
+        self.old = _READ_DEADLINE[0]
+        _READ_DEADLINE[0] = now() + self.seconds
+        return self
+
+    def __exit__(self, *exc):
+        _READ_DEADLINE[0] = self.old
+        return False
+
+
+def proc_read(pid, name, timeout=None, binary=False):
+    """One /proc file, with a deadline: None when the process will not answer in time.
+
+    A read stuck in the kernel cannot be interrupted, so the thread would be abandoned and the
+    reader itself would enter state D - which is exactly how 2 600 `ps` piled up behind one
+    process once. Therefore: never open a memory-walking file for a process we can see
+    is in state D; never open one twice after a timeout; and stop trying when the scan budget is
+    spent. Everything here degrades to "unknown", never to a hung caller."""
+    if name in PROC_MEM_FILES:
+        p = proc_stat(pid)
+        if p and p["state"] in STUCK_STATES:
+            return None
+        if _READ_DEADLINE[0] and now() > _READ_DEADLINE[0]:
+            return None
+        key = (int(pid), name, p["start"] if p else None)
+        if key in _READ_STUCK:
+            return None
+        if len(_READ_STUCK) >= READ_STUCK_MAX:
+            # The table is full of reads that never came back. Opening one more risks another
+            # permanently blocked reader, so answer from `stat` only until entries age out.
+            _prune_read_stuck()
+            if len(_READ_STUCK) >= READ_STUCK_MAX:
+                return None
+
+    def go():
+        with open(proc_path(pid, name), "rb" if binary else "r", errors=None if binary else "replace") as f:
+            return f.read()
+    st, v = run_timed(go, PROC_READ_TIMEOUT if timeout is None else timeout)
+    if st == "timeout" and name in PROC_MEM_FILES:
+        p = proc_stat(pid)
+        _READ_STUCK[(int(pid), name, p["start"] if p else None)] = True   # never evicted while it may still be in flight
+    return v if st == "ok" else None
+
+
+def proc_stuck(pid, pstat=None):
+    """True if the process is in uninterruptible sleep: reading its memory files may never return."""
+    p = pstat or proc_stat(pid)
+    return bool(p and p["state"] in STUCK_STATES)
 
 
 def tree_pids(root, table=None):
@@ -316,15 +425,20 @@ def tree_pids(root, table=None):
     return out
 
 
-def proc_pss(pid):
-    """Proportional set size in bytes (shared pages split between their users), or None."""
-    try:
-        with open(f"/proc/{pid}/smaps_rollup") as f:
-            for line in f:
-                if line.startswith("Pss:"):
-                    return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
-        pass
+def proc_pss(pid, timeout=None, pstat=None):
+    """Proportional set size in bytes (shared pages split between their users), or None.
+    Skipped for a process in state D: smaps_rollup walks its memory and can block forever."""
+    if proc_stuck(pid, pstat):
+        return None
+    text = proc_read(pid, "smaps_rollup", timeout)
+    if text is None:
+        return None
+    for line in text.splitlines():
+        if line.startswith("Pss:"):
+            try:
+                return int(line.split()[1]) * 1024
+            except (ValueError, IndexError):
+                return None
     return None
 
 
@@ -342,12 +456,8 @@ def tree_rss(root, table=None):
 
 def proc_start(pid):
     """Process start time in clock ticks since boot (Linux), or None."""
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            st = f.read()
-        return int(st[st.rindex(")") + 2:].split()[19])
-    except (OSError, ValueError, IndexError):
-        return None
+    p = proc_stat(pid)
+    return p["start"] if p else None
 
 
 def pid_alive(pid, start=None):
@@ -362,13 +472,9 @@ def pid_alive(pid, start=None):
         pass
     except (OSError, ValueError):
         return False
-    try:
-        with open(f"/proc/{int(pid)}/stat") as f:
-            st = f.read()
-        if st[st.rindex(")") + 2:].split()[0] in ("Z", "X"):
-            return False           # exited, not yet reaped by its parent
-    except (OSError, ValueError, IndexError):
-        pass
+    p = proc_stat(int(pid))
+    if p and p["state"] in ("Z", "X"):
+        return False               # exited, not yet reaped by its parent
     if start not in (None, ""):
         cur = proc_start(int(pid))
         if cur is not None and str(cur) != str(start):
@@ -695,7 +801,13 @@ def holders(lane=None):
 
 
 def admit(est, reserve, exclude=None, n=None):
-    """Memory admission: available - (what running jobs have not yet used) >= est + reserve."""
+    """Memory admission: available - (what running jobs still have to grow into) >= est + reserve.
+
+    A job that started less than PEAK_AFTER_S ago is still growing into its estimate, so nothing
+    of its promise is handed to the next one: crediting the difference would let several jobs
+    start together on the strength of a ramp that has not happened yet, and the machine would go
+    over budget before any of them reached its declared size (measured: three 170M jobs
+    admitted on a 350M budget, 449M peak, one killed by the OOM guard)."""
     total, avail = meminfo()
     if avail is None:
         return True, "memory unknown on this platform; admitting"
@@ -705,8 +817,12 @@ def admit(est, reserve, exclude=None, n=None):
         if (h.get("lane"), i) == exclude or h.get("op") == "waiting for memory":
             continue                       # not admitted yet: promises nothing
         jp = h.get("job_pid")              # starting / lease: nothing of ours is using it yet
-        used = tree_rss(jp, table) if jp else 0
-        unmet += max(0, commitment(h) - used)
+        started = h.get("job_since") or h.get("since") or now()
+        if now() - started < PEAK_AFTER_S:
+            unmet += commitment(h)         # still ramping: the whole estimate is spoken for
+        else:
+            used = tree_rss(jp, table) if jp else 0
+            unmet += max(0, commitment(h) - used)
     need = est + reserve
     ok = avail - unmet >= need
     return ok, (f"available {fmt_size(avail)} - promised to running jobs {fmt_size(unmet)} "
@@ -761,8 +877,18 @@ def write_log(rec):
 
 def resolve_sizes(args, cfg):
     est = args.mem if args.mem is not None else parse_size(cfg.get("default_mem", "1G"))
-    limit = args.limit if args.limit is not None else int(est * 1.5)
-    tree = args.tree_limit if getattr(args, "tree_limit", None) is not None else limit
+    # The per-process cap is opt-in (--limit). RLIMIT_DATA / RLIMIT_AS count *virtual* size, not
+    # RSS: importing numpy alone maps 1.1 GB of anonymous memory while RSS is 27 MB (measured),
+    # so a default of 1.5 x --mem killed correct jobs that never used a tenth of
+    # what they declared. The tree limit below measures real memory (PSS/RSS) and is the default
+    # guard; --limit stays for callers who know their program's address-space needs.
+    limit = args.limit if args.limit is not None else 0
+    if getattr(args, "tree_limit", None) is not None:
+        tree = args.tree_limit
+    elif args.limit is not None:
+        tree = limit                 # an explicit --limit keeps the old pairing: --limit 0 = no caps
+    else:
+        tree = int(est * 1.5)
     return est, limit, tree
 
 
@@ -798,7 +924,8 @@ def memory_diagnostic(raw_rc, limit, tree, kind, stopped, peak):
     if stopped:
         cause = "process-tree limit exceeded (confirmed by dingo-pack)"
     elif limit and raw_rc in (-9, -11, 137, 139):
-        cause = "possible memory limit hit; the exit alone does not prove OOM"
+        cause = ("possible per-process limit hit (RLIMIT_DATA/AS counts virtual size: a program can die here "
+                 "far below its sampled RSS; raise or drop --limit before blaming the code under test)")
     elif raw_rc in (-9, -11, 137, 139):
         cause = "possible system OOM or another signal source; check system logs"
     else:
@@ -807,7 +934,8 @@ def memory_diagnostic(raw_rc, limit, tree, kind, stopped, peak):
             f"tree limit={fmt_size(tree)}; sampled tree peak={fmt_size(peak)}; "
             f"exit signal={exit_info}; child exit={raw_rc}. {cause}. "
             "For a large CSV, try chunked reading; check available memory before raising --mem/--limit. "
-            "RLIMIT_DATA/AS is not RSS; a short allocation spike may fall between samples.")
+            "RLIMIT_DATA/AS is not RSS: it caps address space, so it can fire when RSS is small; a short "
+            "allocation spike may also fall between samples.")
 
 
 def cmd_run(args):
@@ -1125,9 +1253,18 @@ def cmd_who(args):
         room = (avail or 0) - info["promised"] - reserve_bytes(cfg)
         _, wst = watch_running()
         paused = still_paused(wst)
-        ok = room >= need and not paused and info["lanes"]["heavy"]["held"] < info["lanes"]["heavy"]["n"]
-        print(f"gate: {'OK' if ok else 'WAIT'} - room {fmt_size(room)} after promised + reserve, need {fmt_size(need)}"
-              + (f", {len(paused)} job(s) paused by watch" if paused else ""))
+        selflock = set(wst.get("selflock") or [])
+        # paused jobs of a session that is already over its own cap are its own problem: waiting
+        # for them blocks every other session for nothing (seen: 15 minutes of WAIT).
+        blocking = [r for r in paused if (r.get("session") or "") not in selflock]
+        ok = room >= need and not blocking and info["lanes"]["heavy"]["held"] < info["lanes"]["heavy"]["n"]
+        extra = ""
+        if blocking:
+            extra = f", {len(blocking)} job(s) paused by watch"
+        elif paused:
+            extra = (f", {len(paused)} job(s) paused by a self-locked session "
+                     f"({', '.join(sorted({r.get('session') or '?' for r in paused}))}) - that session's problem, not the machine's")
+        print(f"gate: {'OK' if ok else 'WAIT'} - room {fmt_size(room)} after promised + reserve, need {fmt_size(need)}" + extra)
         return EXIT_OK if ok else 1
     return EXIT_OK
 
@@ -1193,7 +1330,7 @@ def status_line(cwd, name, pcfg, listing=None):
     rel = lg.replace("{date}", "*")
     d, base = os.path.split(os.path.join(cwd, rel))
     listing = {} if listing is None else listing
-    # the directory part may itself be a pattern (logs kept per team: "../hq-files/指挥台/*/日志/*_{name}.md")
+    # the directory part may itself be a pattern (logs kept per team: "../team-notes/*/logs/*_{name}.md")
     dirs_key = ("dirs", d)
     if dirs_key not in listing:
         listing[dirs_key] = sorted(glob.glob(d)) if glob.has_magic(d) else [d]
@@ -1212,21 +1349,44 @@ def status_line(cwd, name, pcfg, listing=None):
     path = max(files, key=lambda p: os.path.getmtime(p))
     try:
         with open(path, "rb") as f:
+            head = f.read(4096).decode("utf-8", "replace")
             f.seek(0, 2)
             size = f.tell()
             f.seek(max(0, size - 65536))
             tail = f.read().decode("utf-8", "replace")
+        mtime = os.path.getmtime(path)
     except OSError:
         return path, None
     r = re.compile(rx)
-    last = None
+
+    def pick(lines, k):
+        line = lines[k].strip()
+        if line.startswith("#"):                           # "## 状态行（…）" with the text below it
+            nxt = next((x.strip() for x in lines[k + 1:k + 4] if x.strip()), "")
+            line = (line.lstrip("# ") + " " + nxt).strip()
+        return line
+
     lines = tail.splitlines()
-    for k, line in enumerate(lines):
+    hits = [k for k, line in enumerate(lines) if r.search(line)]
+    last = pick(lines, hits[-1]) if hits else None
+    # Many logs keep the status line at the top (between the title and the first "## " section) and edit
+    # it in place, while others add lines further down (someone else's closing note, a correction). The last line by
+    # position is then not the current one: of that top line and the last line, the one whose own time
+    # is later wins; position breaks ties and decides when either has no time. A first line
+    # inside a section is not a top line: that log appends, and position alone decides.
+    hl, top = head.splitlines(), None
+    for k, line in enumerate(hl[1:], 1):
         if r.search(line):
-            last = line.strip()
-            if last.startswith("#"):                       # "## 状态行（…）" with the text below it
-                nxt = next((x.strip() for x in lines[k + 1:k + 4] if x.strip()), "")
-                last = (last.lstrip("# ") + " " + nxt).strip()
+            top = pick(hl, k)
+            break
+        if line.startswith("##"):
+            break
+    if top and top != last:
+        if last is None:
+            last = top
+        elif _stamp(top) and _stamp(last):
+            if parse_status(top, mtime)[2] > parse_status(last, mtime)[2]:
+                last = top
     return path, last
 
 
@@ -1710,11 +1870,9 @@ def reopen(rows, args, prompt_key, default_prompt):
 
 # ---------------------------------------------------------------- ghosts (scan)
 
-def proc_environ(pid, keys=(b"CLAUDE_PID", b"CLAUDE_CODE_SESSION_ID", b"DINGO_SCOPE_TAG")):
-    try:
-        with open(f"/proc/{pid}/environ", "rb") as f:
-            raw = f.read()
-    except OSError:
+def proc_environ(pid, keys=(b"CLAUDE_PID", b"CLAUDE_CODE_SESSION_ID", b"DINGO_SCOPE_TAG"), timeout=None):
+    raw = proc_read(pid, "environ", timeout, binary=True)
+    if raw is None:
         return {}
     out = {}
     for item in raw.split(b"\0"):
@@ -1724,29 +1882,25 @@ def proc_environ(pid, keys=(b"CLAUDE_PID", b"CLAUDE_CODE_SESSION_ID", b"DINGO_SC
     return out
 
 
-def proc_cmdline(pid):
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
-    except OSError:
-        return ""
+def proc_cmdline(pid, timeout=None):
+    raw = proc_read(pid, "cmdline", timeout, binary=True)
+    return "" if raw is None else raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
 
 
 def proc_detached(pid):
     """True if the process looks deliberately left running: SIGHUP ignored (nohup), its own
     session leader (setsid / daemon), or a terminal multiplexer."""
     try:
-        with open(f"/proc/{pid}/status") as f:
-            for line in f:
-                if line.startswith("SigIgn:") and int(line.split()[1], 16) & 1:
-                    return True
-        with open(f"/proc/{pid}/stat") as f:
-            st = f.read()
-        comm = st[st.index("(") + 1:st.rindex(")")]
-        fields = st[st.rindex(")") + 2:].split()
-        if int(fields[3]) == int(pid):                 # session id == pid
+        text = proc_read(pid, "status") or ""       # bounded: status reads the process's memory
+        for line in text.splitlines():
+            if line.startswith("SigIgn:") and int(line.split()[1], 16) & 1:
+                return True
+        p = proc_stat(pid)
+        if not p:
+            return False
+        if p["sid"] == int(pid):                       # session id == pid
             return True
-        if comm.startswith(("tmux", "screen")):
+        if p["comm"].startswith(("tmux", "screen")):
             return True
     except (OSError, ValueError, IndexError):
         pass
@@ -1754,8 +1908,12 @@ def proc_detached(pid):
 
 
 def scan_ghosts(roster=None):
-    """Process trees whose Claude Code session is gone. Returns a list of groups:
-    {owner_pid, sid, name, pids, pss, cmd, age_s, kept, why_kept}."""
+    """Process trees whose Claude Code session is gone (bounded /proc reads)."""
+    with read_budget(8):
+        return _scan_ghosts(roster)
+
+
+def _scan_ghosts(roster=None):
     if not os.path.isdir("/proc/self"):
         return []
     table = proc_table()
@@ -2798,7 +2956,7 @@ def cmd_queue(args):
 
 # box claims: one line per job in a plain text file on the box. dingo writes
 #   who · task · cards · 预计完成 柏林 MM-DD HH:MM · 完成标志 PATH · 写于 柏林 MM-DD HH:MM
-# and also reads the free-form lines people write by hand ("I-1005-0-202 · GPU 0：… 起 box 01:43 … 预计柏林 10-06 05:05 完").
+# and also reads the free-form lines people write by hand ("job-17 · GPU 0: … started 01:43 … expected 10-06 05:05 done").
 # A line whose done flag exists is removed by the next claim command run on that box (check / add / wait / sweep / watch);
 # a line past its expected end + grace, with no compute process on its cards, is "stale": reported and alerted, never deleted.
 CLAIM_SEP = " · "
@@ -3765,12 +3923,11 @@ CLK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
 
 def proc_ticks(pid):
+    text = proc_read(pid, "stat", timeout=PROC_READ_TIMEOUT)
     try:
-        with open(f"/proc/{pid}/stat") as f:
-            st = f.read()
-        x = st[st.rindex(")") + 2:].split()
+        x = text[text.rindex(")") + 2:].split()
         return int(x[11]) + int(x[12])
-    except (OSError, ValueError, IndexError):
+    except (AttributeError, ValueError, IndexError):
         return None
 
 
@@ -3930,7 +4087,12 @@ def spin_reason(w, pid, age, table, cmdlines):
 
 
 def session_tasks(sample_s=None, show_all=False):
-    """Live sessions with their child processes, waiting loops and spin flags."""
+    """Live sessions with their child processes, waiting loops and spin flags (bounded /proc reads)."""
+    with read_budget(8):
+        return _session_tasks(sample_s, show_all)
+
+
+def _session_tasks(sample_s=None, show_all=False):
     if not os.path.isdir("/proc/self"):
         return []
     table = proc_table()
@@ -4167,35 +4329,45 @@ def session_memory():
 
 def cmd_top(args):
     while True:
-        rows = session_memory()
-        total, avail = meminfo()
-        table = proc_table()
-        inside = set()
-        for _, pid, _, _ in rows:
-            inside.update(tree_pids(pid, table))
-        others = sorted(((rss, p) for p, (_, rss) in table.items() if p not in inside), reverse=True)[:5]
-        g = ghost_summary()
-        out = [f"dingo-pack top · {time.strftime('%H:%M:%S')} · free {fmt_size(avail)} of {fmt_size(total)}"
-               f" · sessions {fmt_size(sum(r[2] for r in rows))} · ghosts {g.get('n', '?')} ({fmt_size(g.get('pss'))})"]
-        out.append(f"  {'session':<26} {'memory':>8} {'procs':>6}")
-        for name, pid, mem, n in rows:
-            out.append(f"  {name[:26]:<26} {fmt_size(mem):>8} {n:>6}")
-        out.append("  other big processes (RSS):")
-        for rss, p in others:
-            out.append(f"  {fmt_size(rss):>8}  {p:>7}  {proc_cmdline(p)[:60]}")
-        tasks = session_tasks(show_all=args.all)
-        if args.json:
-            print(json.dumps({"memory": rows, "tasks": tasks}, ensure_ascii=False, default=str))
-            return EXIT_OK
-        if args.watch:
-            sys.stdout.write("\033[2J\033[H")
-        print("\n".join(out), flush=True)
-        print("  sessions: children (> 60 s), what they wait for, tokens today:")
-        print_tasks(tasks)
-        sys.stdout.flush()
-        if not args.watch:
-            return EXIT_OK
-        time.sleep(args.watch)
+        with read_budget(8):
+            r = _top_once(args)
+        if r is not None:
+            return r
+
+
+def _top_once(args):
+    """One render of the task manager; the caller bounds its /proc reads."""
+    rows = session_memory()
+    total, avail = meminfo()
+    table = proc_table()
+    inside = set()
+    for _, pid, _, _ in rows:
+        inside.update(tree_pids(pid, table))
+    others = sorted(((rss, p) for p, (_, rss) in table.items() if p not in inside), reverse=True)[:5]
+    g = ghost_summary()
+    out = [f"dingo-pack top · {time.strftime('%H:%M:%S')} · free {fmt_size(avail)} of {fmt_size(total)}"
+           f" · sessions {fmt_size(sum(r[2] for r in rows))} · ghosts {g.get('n', '?')} ({fmt_size(g.get('pss'))})"]
+    out.append(f"  {'session':<26} {'memory':>8} {'procs':>6}")
+    for name, pid, mem, n in rows:
+        out.append(f"  {name[:26]:<26} {fmt_size(mem):>8} {n:>6}")
+    out.append("  other big processes (RSS):")
+    for rss, p in others:
+        out.append(f"  {fmt_size(rss):>8}  {p:>7}  {proc_cmdline(p)[:60]}")
+    for line in watch_summary_lines():
+        out.append(line)
+    tasks = session_tasks(show_all=args.all)
+    if args.json:
+        print(json.dumps({"memory": rows, "tasks": tasks}, ensure_ascii=False, default=str))
+        return EXIT_OK
+    if args.watch:
+        sys.stdout.write("\033[2J\033[H")
+    print("\n".join(out), flush=True)
+    print("  sessions: children (> 60 s), what they wait for, tokens today:")
+    print_tasks(tasks)
+    sys.stdout.flush()
+    if not args.watch:
+        return EXIT_OK
+    time.sleep(args.watch)
 
 
 def cmd_overview(args):
@@ -4237,7 +4409,7 @@ EVERYDAY = """core:
 moving: board, name, card, lint, queue -> shepherd-dispatch; claim, boxes -> boobook-watch
 no longer maintained: close-all, stow, and opening terminal tabs (resume / restore / unstow --via wt|tmux)"""
 
-# 0.5 shrink (Yi 11-04 10:41 / 15:22): these still work, each says once where it is going.
+# 0.5 shrink: these still work, each says once where it is going.
 MOVED = {"board": "shepherd-dispatch", "name": "shepherd-dispatch", "card": "shepherd-dispatch",
          "lint": "shepherd-dispatch", "queue": "shepherd-dispatch",
          "claim": "boobook-watch", "boxes": "boobook-watch"}
@@ -4292,7 +4464,8 @@ def watch_config(cfg=None, total=None):
     cfg = cfg if cfg is not None else config()
     w = dict(cfg.get("watch") or {})
     for k in ("warn", "stop", "kill", "interval", "min_target", "grow_warn", "grow_window", "unowned", "resume_hold",
-              "stall_h", "stall_every"):
+              "stall_h", "stall_every", "stuck_secs", "stuck_net_secs", "stuck_heavy", "stuck_scan_max", "crash_max", "crash_window",
+              "respawn_delay", "odd_max", "odd_window"):
         e = os.environ.get("DINGO_WATCH_" + k.upper())
         if e:
             w[k] = e
@@ -4318,6 +4491,33 @@ def watch_config(cfg=None, total=None):
         "stall_every": float(w.get("stall_every", 0 if os.environ.get("DINGO_SCOPE_TAG") else 300)),
         "stall_words": list(w.get("stall_words") or ["跑着"]),
         "alert_every": float(w.get("alert_every", 120)),
+        # kernel-stuck is reported only once a process has stayed in state D this long. A short D is
+        # normal I/O (over three days, 13 425 of 13 831 reports were "D 0 s"); the one real hang
+        # lasted hours. 30 s = 15 scans at the default interval, and no non-network D outside that
+        # hang reached it.
+        "stuck_secs": float(w.get("stuck_secs", 30)),
+        # D on a network / 9p disk (e.g. git on a Windows drive under WSL): counted in status.json and
+        # alerted only past the much longer stuck_net_secs - a slow share is not a stuck kernel, but a
+        # share that has stopped answering for ten minutes is. Matched as wchan prefixes.
+        "stuck_net_wchan": list(w.get("stuck_net_wchan") or STUCK_NET_WCHAN),
+        "stuck_net_secs": float(w.get("stuck_net_secs", 600)),
+        # More than stuck_heavy processes in D: the kernel is jammed and every /proc read adds to it.
+        # Then a scan reads only `stat` for them (no syscall / wchan / fds) and walks the ancestors of
+        # at most stuck_scan_max new ones per scan; the rest wait for the next scan. Over ten days the
+        # most D at once on a normal day was 36; the pile-ups were 526-813, 2 710 and 5 071. 200 x a few stat reads each keeps one scan well under a second.
+        "stuck_heavy": int(float(w.get("stuck_heavy", 200))),
+        "stuck_scan_max": int(float(w.get("stuck_scan_max", 200))),
+        # watch --respawn (what --daemon starts): restart a watch that died, after respawn_delay s;
+        # crash_max deaths within crash_window s is a crash loop - stop and say so. Once the watch
+        # segfaulted about once a minute for two hours; 5 in 10 min is faster than any benign restart.
+        "crash_max": int(float(w.get("crash_max", 5))),
+        "crash_window": float(w.get("crash_window", 600)),
+        "respawn_delay": float(w.get("respawn_delay", 2)),
+        # odd_max exceptions of a type the scan code cannot raise (TypeError / KeyError / SystemError)
+        # within odd_window s: the interpreter may be corrupt (in one crash all 7 came in the minute
+        # before a SIGSEGV) - exit and let the supervisor start a fresh one.
+        "odd_max": int(float(w.get("odd_max", 2))),
+        "odd_window": float(w.get("odd_window", 60)),
     }
     return out
 
@@ -4326,16 +4526,16 @@ def watch_dir():
     return sub_dir("watch")
 
 
-def proc_info(pid):
+def proc_info(pid, pstat=None):
     """(comm, state, uid) of a process, or None."""
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            st = f.read()
-        comm = st[st.index("(") + 1:st.rindex(")")]
-        state = st[st.rindex(")") + 2:].split()[0]
-        return comm, state, os.stat(f"/proc/{pid}").st_uid
-    except (OSError, ValueError, IndexError):
+    p = pstat or proc_stat(pid)
+    if not p:
         return None
+    try:
+        uid = os.stat(proc_path(pid, "")).st_uid
+    except OSError:
+        return None
+    return p["comm"], p["state"], uid
 
 
 PIDFD = hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")   # Python 3.9+ on Linux 5.3+
@@ -4417,6 +4617,84 @@ def signal_record(r, sig, protect=()):
     return [m["pid"] for m in ms if signal_member(m, sig, protect)]
 
 
+def stuck_fds(pid, n=8):
+    """Open fd numbers of a stuck process. The *targets* are not read: readlink on an fd whose
+    file sits on a hung mount blocks exactly like the read we are avoiding."""
+    try:
+        fds = sorted(os.listdir(proc_path(pid, "fd")), key=lambda x: int(x) if x.isdigit() else 0)
+    except OSError:
+        return []
+    return fds[:n]
+
+
+def stuck_is_net(wchan, prefixes=STUCK_NET_WCHAN):
+    """A D process waiting on a network / 9p file system (by its wchan): slow I/O, not a stuck kernel."""
+    w = (wchan or "").strip()
+    return bool(w) and any(w.startswith(x) for x in prefixes)
+
+
+def kill_pending(pid):
+    """True if SIGKILL is queued but the process is still alive; None when it cannot be asked
+    safely (status of a process in state D reads its memory and may block)."""
+    if proc_stuck(pid):
+        return None
+    text = proc_read(pid, "status") or ""
+    for line in text.splitlines():
+        if line.startswith(("SigPnd:", "ShdPnd:")):
+            try:
+                if int(line.split()[1], 16) & (1 << (signal.SIGKILL - 1)):
+                    return True
+            except (ValueError, IndexError):
+                pass
+    return False
+
+
+def kernel_stuck(limit=20):
+    """Processes in uninterruptible sleep and what is piling up behind them, read-only and bounded.
+    {rows: [...], groups: {comm: n}, total: n}"""
+    with read_budget(5):
+        return _kernel_stuck(limit)
+
+
+def _kernel_stuck(limit=20):
+    table = proc_table()
+    rows, groups = [], {}
+    for pid in table:
+        p = proc_stat(pid)
+        if not p or p["state"] not in STUCK_STATES:
+            continue
+        groups[p["comm"]] = groups.get(p["comm"], 0) + 1
+        age = None
+        bt = boot_time()
+        if bt:
+            age = max(0, int(now() - bt - p["start"] / CLK)) if CLK else None
+        rows.append({"pid": pid, "comm": p["comm"], "ppid": p["ppid"], "state": p["state"],
+                     "rss": p["rss"], "age_s": age,
+                     "session": ancestor_session(pid, table),
+                     "syscall": (proc_read(pid, "syscall") or "").strip(),
+                     "wchan": (proc_read(pid, "wchan") or "").strip(),
+                     "fds": stuck_fds(pid), "kill_pending": kill_pending(pid)})
+    rows.sort(key=lambda r: -(r["age_s"] or 0))
+    return {"rows": rows[:limit], "total": len(rows), "groups": groups, "shown": min(len(rows), limit)}
+
+
+def ancestor_session(pid, table):
+    """Best-effort owner name for a process whose own /proc/environ cannot be read: nearest agent
+    ancestor (its environ is readable), else the ancestor chain by comm."""
+    chain, p, seen = [], table.get(pid, (0, 0))[0], 0
+    while p and p in table and seen < 64:
+        q = proc_stat(p)
+        if not q:
+            break
+        chain.append(f"{q['comm']}({p})")
+        info = proc_info(p, q)
+        if info and info[0] in AGENT_COMMS:
+            env = proc_environ(p, WATCH_ENV_KEYS)
+            return env.get("DINGO_SESSION") or (env.get("CLAUDE_PID") and f"claude pid {env['CLAUDE_PID']}") or chain[-1]
+        p, seen = table[p][0], seen + 1
+    return " <- ".join(chain[:4]) if chain else None
+
+
 def watch_control_lock():
     """Short-lived lock for the resume mailbox and status.json (not the watch's lifetime lock)."""
     lk = open(os.path.join(watch_dir(), "control.lock"), "a+")
@@ -4468,6 +4746,7 @@ class Watcher:
         self.events = []
         self.level = "ok"
         self.resumes = {}         # "pid:start" -> automatic resumes so far; survives pause cycles and restarts
+        self.blocked = {}         # pid -> processes in state D that we refused to read
         old = read_json(os.path.join(watch_dir(), "status.json"), {}) or {}
         for r in old.get("stopped") or []:   # a restarted watch keeps track of what it paused
             if pid_alive(r.get("pid"), r.get("start")) and (proc_info(r["pid"]) or ("", ""))[1] == "T":
@@ -4513,13 +4792,13 @@ class Watcher:
         return f"{int(pid)}:{start}"
 
     # -- attribution
-    def attribute(self, pid, table, start=None):
+    def attribute(self, pid, table, start=None, own_env=True):
         start = proc_start(pid) if start is None else start
         key = (pid, start)
-        if key in self.attr:
+        if key in self.attr and own_env:
             return self.attr[key]
         info = proc_info(pid)
-        env = proc_environ(pid, WATCH_ENV_KEYS)
+        env = proc_environ(pid, WATCH_ENV_KEYS) if own_env else {}
         is_agent = bool(info and info[0] in AGENT_COMMS)
         sess, smax = env.get("DINGO_SESSION"), env.get("DINGO_SESSION_MAX")
         if not sess and env.get("CLAUDE_PID", "").isdigit():
@@ -4540,7 +4819,8 @@ class Watcher:
         if not sess and is_agent:
             sess = f"{info[0]} pid {pid}"
         val = (sess, int(smax) if smax and smax.isdigit() else None, is_agent, env.get("DINGO_SCOPE_TAG"))
-        self.attr[key] = val
+        if own_env:
+            self.attr[key] = val            # a stat-only answer is not cached: the next scan may read once more
         return val
 
     def event(self, kind, **kw):
@@ -4569,19 +4849,31 @@ class Watcher:
         wc, t = self.wc, now()
         total, avail = meminfo()
         table = proc_table()
+        # Optional /proc reads (environ, cmdline, smaps) stop after this budget; `stat` and the
+        # memory maths carry on. One scan must never take longer than a few intervals, or the
+        # guard is blind exactly when the machine is in trouble.
+        read_until = t + float(os.environ.get("DINGO_SCAN_READ_BUDGET", "5"))
         ancestors, p = set(), self.me
         while p and p in table and p not in ancestors:
             ancestors.add(p)
             p = table[p][0]
-        procs = {}
+        procs, stuck, dlist = {}, {}, []
         for pid, (ppid, rss) in table.items():
             if pid in ancestors:
                 continue
-            info = proc_info(pid)
+            p = proc_stat(pid)
+            info = proc_info(pid, p)
             if not info or info[2] != self.uid:
                 continue
-            start = proc_start(pid)
-            sess, smax, is_agent, tag = self.attribute(pid, table, start)
+            start = p["start"]
+            # A process in uninterruptible sleep (D) will not answer a read of its cmdline /
+            # environ / smaps until the kernel lets go; one of those once hung this guard.
+            # Attribute it by its ancestors only, keep it out of the memory maths,
+            # and report it instead of waiting on it.
+            if p["state"] in STUCK_STATES:
+                dlist.append((pid, p, ppid, rss))
+                continue
+            sess, smax, is_agent, tag = self.attribute(pid, table, start, own_env=now() < read_until)
             if self.scope and tag != self.scope:
                 continue                     # scoped (self-test): never look at real processes
             procs[pid] = {"pid": pid, "ppid": ppid, "rss": rss, "comm": info[0], "state": info[1],
@@ -4590,6 +4882,62 @@ class Watcher:
             h.append((t, rss))
             while h and t - h[0][0] > wc["grow_window"]:
                 h.pop(0)
+        # Many in D (see stuck_heavy): `stat` only, and the ancestor walk for at most stuck_scan_max
+        # new ones; the others are kept as "pending" and walked in the next scans.
+        heavy = len(dlist) > wc["stuck_heavy"]
+        walked = pending = 0
+        for pid, p, ppid, rss in dlist:
+            prev = self.blocked.get(pid) or {}
+            if prev and prev.get("start") != p["start"]:
+                prev = {}                           # the pid names another process now
+            if heavy and prev and not prev.get("pending"):
+                sess, tag, wait = prev.get("session"), prev.get("tag"), False
+            elif heavy and walked >= wc["stuck_scan_max"]:
+                sess, tag, wait = None, None, True
+            else:
+                sess, _, _, tag = self.attribute(pid, table, p["start"], own_env=False)
+                walked, wait = walked + 1, False
+            if self.scope and tag != self.scope:
+                continue
+            pending += wait
+            stuck[pid] = {"pid": pid, "comm": p["comm"], "ppid": ppid, "rss": rss, "session": sess, "tag": tag,
+                          "pending": wait, "since": prev.get("since") or t, "start": p["start"],
+                          "syscall": prev.get("syscall", ""), "wchan": prev.get("wchan", ""),
+                          "fds": prev.get("fds", []), "kill_pending": prev.get("kill_pending")}
+        for pid, b in stuck.items():
+            if b["since"] == t and not heavy:   # first seen: the expensive details, once
+                b["syscall"] = (proc_read(pid, "syscall") or "").strip()
+                b["wchan"] = (proc_read(pid, "wchan") or "").strip()
+                b["fds"] = stuck_fds(pid)
+            b["secs"] = int(t - b["since"])
+            b["kill_pending"] = None if heavy else kill_pending(pid)
+            b["net"] = stuck_is_net(b["wchan"], wc["stuck_net_wchan"])
+        self.blocked = stuck
+        groups = {}
+        for b in stuck.values():
+            groups[b["comm"]] = groups.get(b["comm"], 0) + 1
+        # only a long D is a stuck kernel worth an alert; a network-disk wait needs much longer
+        alarm = {pid: b for pid, b in stuck.items()
+                 if b["secs"] >= (wc["stuck_net_secs"] if b["net"] else wc["stuck_secs"])}
+        if alarm:
+            # Name the oldest few and summarise the rest: once 2 600 `ps` piled up in D
+            # behind one process, and one event each would flood the log instead of the operator.
+            for b in sorted(alarm.values(), key=lambda b: -b["secs"])[:3]:
+                self.alert(("stuck", b["pid"]), "kernel-stuck", pid=b["pid"], session=b["session"], rss=b["rss"],
+                           msg=(f"pid {b['pid']} ({b['comm']}) is stuck in the kernel (state D {b['secs']} s, "
+                                f"syscall {b['syscall'] or '?'}, wchan {b['wchan'] or '?'}"
+                                + (", SIGKILL pending but not delivered" if b["kill_pending"] else "") +
+                                f"). It cannot be killed until the kernel releases it, and reads of its "
+                                f"/proc block: do not run ps / dingo-pack who against it. "
+                                f"Processes in D now: " + ", ".join(f"{k} {v}" for k, v in groups.items())))
+            if len(alarm) > 3:
+                self.alert(("stuck-groups",), "kernel-stuck", n=len(alarm), groups=groups,
+                           msg=(f"{len(alarm)} processes are in state D for {wc['stuck_secs']:g} s or more ("
+                                + ", ".join(f"{k} {v}" for k, v in groups.items())
+                                + "): they are readers stuck behind whichever process holds the kernel. "
+                                  "See `dingo-pack stuck`; reads of their /proc block, so ps / who hung behind them."
+                                + (f" Over {wc['stuck_heavy']} in D: this watch reads only their stat now "
+                                   f"(no syscall / wchan)." if heavy else "")))
         for pid in list(self.hist):
             if pid not in procs:
                 del self.hist[pid]
@@ -4634,6 +4982,24 @@ class Watcher:
         def who_line(n=3):
             top = sorted(sessions.items(), key=lambda kv: -kv[1]["rss"])[:n]
             return ", ".join(f"{k} {fmt_size(v['rss'])}" for k, v in top)
+
+        # A session over its cap whose every remaining job is paused can never shrink below the
+        # cap: the paused jobs keep their memory, nothing runs to free it, so the guard never
+        # resumes them. Seen once: a session's two 4G jobs hit an 8G cap, 11 children were paused and
+        # `who --gate` kept the whole machine waiting for 15 minutes.
+        selflock = []
+        for name, s in sessions.items():
+            if s["max"] and s["rss"] > s["max"]:
+                live = [pr for pr in procs.values() if pr["session"] == name and pr["state"] not in ("T", "t")]
+                if not live:
+                    selflock.append(name)
+        self.selflock = selflock
+        for name in selflock:
+            self.alert(("selflock", name), "session-selflock", session=name, rss=sessions[name]["rss"],
+                       msg=(f"session {name} is over its cap {fmt_size(sessions[name]['max'])} and every one of "
+                            f"its jobs is paused (state T): it can never fall below the cap by itself, so it "
+                            f"will stay paused for ever. Raise the cap, or stop that work; the machine is "
+                            f"not short of memory for anyone else."))
 
         # 1. alerts
         level = "ok"
@@ -4703,7 +5069,17 @@ class Watcher:
                   "sessions": [{"session": k, "rss": v["rss"], "procs": v["n"], "max": v["max"],
                                 "top_pid": v["top"], "top_cmd": proc_cmdline(v["top"])[:80] if v["top"] else ""}
                                for k, v in top],
-                  "stopped": [], "auto_resumes": dict(self.resumes), "stalled": list(getattr(self, "stalled", [])), "events": self.events[-10:], "nprocs": len(procs)}
+                  "stopped": [], "auto_resumes": dict(self.resumes), "stalled": list(getattr(self, "stalled", [])), "events": self.events[-10:], "nprocs": len(procs),
+                  "selflock": list(getattr(self, "selflock", [])),
+                  "blocked": [{"pid": b["pid"], "comm": b["comm"], "session": b["session"], "secs": b["secs"],
+                               "syscall": b["syscall"], "wchan": b["wchan"], "fds": b["fds"],
+                               "kill_pending": b["kill_pending"], "rss": b["rss"], "net": b["net"]}
+                              for b in sorted(stuck.values(), key=lambda b: (b["net"], -b["secs"]))[:10]],
+                  "blocked_groups": groups if stuck else {}, "blocked_total": len(stuck),
+                  "blocked_net": sum(1 for b in stuck.values() if b["net"]),
+                  "blocked_alarm": len(alarm), "stuck_secs": wc["stuck_secs"],
+                  "stuck_heavy": heavy, "stuck_pending": pending,
+                  "scan_s": round(now() - t, 2)}
         try:
             with watch_control_lock():
                 take_resume_requests(self, locked=True)   # a `watch resume` during the scan is honoured, not overwritten
@@ -4725,10 +5101,8 @@ class Watcher:
 
     def pause(self, pr, pids, why, reason, procs=None):
         cmd = proc_cmdline(pr["pid"])
-        try:
-            cwd = os.readlink(f"/proc/{pr['pid']}/cwd")
-        except OSError:
-            cwd = ""
+        st, v = run_timed(lambda: os.readlink(f"/proc/{pr['pid']}/cwd"), 0.3)
+        cwd = v if st == "ok" and isinstance(v, str) else ""
         procs = procs or {}
         ms = self.members(pids, procs)
         root = next(m for m in ms if m["pid"] == pr["pid"]) if any(m["pid"] == pr["pid"] for m in ms) else member(pr["pid"])
@@ -4768,10 +5142,8 @@ class Watcher:
 
     def kill(self, pr, pids, avail, procs):
         cmd = proc_cmdline(pr["pid"])
-        try:
-            cwd = os.readlink(f"/proc/{pr['pid']}/cwd")
-        except OSError:
-            cwd = ""
+        st, v = run_timed(lambda: os.readlink(f"/proc/{pr['pid']}/cwd"), 0.3)
+        cwd = v if st == "ok" and isinstance(v, str) else ""
         mem = sum(procs[q]["rss"] for q in pids if q in procs)
         if not self.dry:
             ms = self.members(pids, procs)
@@ -4819,21 +5191,379 @@ def still_paused(st):
     return out
 
 
+def guard_decision(pid, age_s, interval):
+    """Does the guard need to start the watch again? No pid (lock free) or a stale last scan."""
+    return "restart" if (not pid) or age_s > max(3 * float(interval or 2), 120) else "ok"
+
+
+def find_lock_holder(lock_path):
+    """pid of the process that holds a *lock* on this file, or None.
+
+    Opening the file is not locking it: `tail -f watch.log` keeps the inode open and shows up in
+    every fd scan while holding nothing, and treating it as the lock holder blocked recovery
+    (found in review). /proc/locks lists real locks only, with the holder's pid."""
+    try:
+        st = os.stat(lock_path)
+    except OSError:
+        return None
+    want = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+    try:
+        with open(os.path.join(PROC_ROOT, "locks")) as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    for line in lines:
+        parts = line.split()
+        # "1: FLOCK  ADVISORY  WRITE 1234 fd:01:12345678 0 EOF"
+        if len(parts) < 8 or not parts[0].endswith(":") or parts[1] not in ("FLOCK", "POSIX", "OFDLCK"):
+            continue
+        try:
+            pid = int(parts[4])
+            maj_s, min_s, ino_s = parts[5].split(":")
+            if (int(maj_s, 16), int(min_s, 16), int(ino_s)) == want:
+                return pid
+        except (ValueError, IndexError):
+            continue
+    return None
+
+
+def watch_identity(pid):
+    """(True, argv) only when this really is `python …/dingo-pack watch …` - an exact argv check,
+    not a substring: a `tail -f watch.log` or `vim dingo-pack-watch.md` must never be signalled
+    just because its command line contains both words."""
+    raw = proc_read(pid, "cmdline", binary=True)
+    if not raw:
+        return False, "(command line unreadable)"
+    argv = [x.decode("utf-8", "replace") for x in raw.split(b"\0") if x]
+    shown = " ".join(argv[:4])[:120]
+    if len(argv) < 3:
+        return False, shown
+    if not os.path.basename(argv[0]).startswith("python"):
+        return False, shown
+    if os.path.basename(argv[1]) != "dingo-pack":
+        return False, shown
+    if argv[2] != "watch":
+        return False, shown
+    return True, shown
+
+
+def guard_restart(stale_pid, old_t, timeout=20.0):
+    """Bring the watch back and prove it: (ok, detail).
+
+    A stale watch still holds the lock, so a plain `watch --daemon` exits "already running" and
+    changes nothing - the very case where nobody is looking. Therefore: if the
+    lock holder really is one of our watches, stop it (SIGTERM, then SIGKILL), then start a new
+    one, then wait for a *fresh* scan before calling it a success. If it cannot be stopped
+    (state D, or the lock is held by something else) say so instead of pretending."""
+    notes = []
+    spid = stop_supervisor()       # else it would start the stopped watch again next to ours
+    if spid:
+        notes.append(f"stopped its respawn supervisor pid {spid}")
+    holder = find_lock_holder(os.path.join(watch_dir(), "lock"))
+    if holder:
+        ok_id, shown = watch_identity(holder)
+        if not ok_id:
+            return False, (f"the watch lock is held by pid {holder} ({shown}), which is not a dingo-pack "
+                           f"watch; not touching it")
+        for sig, name in ((signal.SIGTERM, "SIGTERM"), (signal.SIGKILL, "SIGKILL")):
+            try:
+                os.kill(int(holder), sig)
+            except OSError:
+                break
+            end = now() + 5.0
+            while now() < end and pid_alive(int(holder)):
+                time.sleep(0.2)
+            if not pid_alive(int(holder)):
+                notes.append(f"stopped the stale watch pid {holder} with {name}")
+                break
+        if pid_alive(int(holder)):
+            return False, (f"watch pid {holder} does not die (state D or a signal it ignores); "
+                           f"the guard cannot restart it from here - restart WSL or kill it by hand")
+        still = find_lock_holder(os.path.join(watch_dir(), "lock"))
+        if still:
+            return False, f"the lock is still held by pid {still} after stopping {holder}"
+    pid, _ = watch_running()
+    if pid:
+        return False, (f"the watch lock is still held by pid {pid}, but /proc/locks does not name it; "
+                       f"not touching it")
+    try:
+        subprocess.run([sys.executable, os.path.abspath(__file__), "watch", "--daemon"],
+                       capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"could not start watch: {e}"
+    end = now() + timeout
+    while now() < end:
+        pid2, st2 = watch_running()
+        if pid2 and float(st2.get("t") or 0) > float(old_t or 0):
+            notes.append(f"new watch pid {pid2} is scanning")
+            return True, "; ".join(notes)
+        time.sleep(0.5)
+    return False, "; ".join(notes + [f"a watch was started but no fresh scan appeared within {timeout:.0f} s"])
+
+
+def guard_stale_text(g_age, every, pid, st):
+    """The STALE line for a guard that has stopped checking. Two readings, judged and said apart: the
+    guard's own heartbeat (guard.json) and the watch's (its lock + last scan). A dead guard next to a
+    live watch is not "the watch may be down" - that sends people to restart a healthy watch.
+    The guard has no keeper of its own: run `guard --once` from cron / systemd."""
+    head = (f"guard: STALE - the guard itself has not checked for {g_age / 60:.1f} min (every {every:g} s): "
+            f"it is not running and nobody restarts it")
+    if pid:
+        age = now() - float((st or {}).get("t") or 0)
+        interval = float((st or {}).get("interval") or 2)
+        if age > max(3 * interval, 120):
+            return (f"{head}. The watch itself is STUCK too (pid {pid}, last scan {age / 60:.1f} min ago) - "
+                    f"see the watch line above; then start the guard: dingo-pack watch guard --every {every:g}")
+        return (f"{head}. The watch itself is running (pid {pid}, scan {age:.0f} s ago) - leave it; start the "
+                f"guard again: dingo-pack watch guard --every {every:g} (or `guard --once` from cron)")
+    return (f"{head}. The watch itself is not running either - start it: dingo-pack watch --daemon, "
+            f"then the guard: dingo-pack watch guard --every {every:g}")
+
+
 def watch_summary_lines():
     pid, st = watch_running()
     lines = []
     if pid:
         age = now() - st.get("t", 0)
-        lines.append(f"watch: running (pid {pid}, scan {age:.0f} s ago, level {st.get('level')}"
-                     f"{', dry run' if st.get('dry_run') else ''})")
+        interval = float(st.get("interval") or 2)
+        if age > max(3 * interval, 120):
+            # The guard cannot report its own hang; a stale timestamp is the external heartbeat.
+            lines.append(f"watch: STUCK? running (pid {pid}) but its last scan was {age / 60:.1f} min ago "
+                         f"(every {interval:g} s). It is probably blocked on a process stuck in the kernel - "
+                         f"see `dingo-pack stuck`; restart it with `dingo-pack watch stop` then `--daemon`.")
+        else:
+            lines.append(f"watch: running (pid {pid}, scan {age:.0f} s ago, level {st.get('level')}"
+                         f"{', dry run' if st.get('dry_run') else ''})")
+        blocked = [b for b in st.get("blocked") or [] if not b.get("net")]
+        if st.get("blocked_net"):
+            lines.append(f"  {st['blocked_net']} in D waiting on a network / 9p disk (slow I/O; alerted only past stuck_net_secs)")
+        for b in blocked[:3]:
+            lines.append(f"  stuck pid {b['pid']} {b['comm']} {b.get('session') or '?'} {b.get('secs', 0)} s"
+                         f" in D (syscall {b.get('syscall') or '?'}"
+                         + (", SIGKILL pending - cannot die until the kernel lets go" if b.get("kill_pending") else "")
+                         + ") - reading its /proc blocks; do not run ps / who against it")
+        more = st.get("blocked_total", 0) - (st.get("blocked_net") or 0) - 3
+        if more > 0:
+            groups = st.get("blocked_groups") or {}
+            lines.append(f"  ... and {more} more in D ("
+                         + ", ".join(f"{k} {v}" for k, v in groups.items()) + "): dingo-pack stuck")
     else:
-        lines.append("watch: not running - start it: dingo-pack watch --daemon")
+        rs = crash_loop_mark()
+        if rs:
+            lines.append(f"watch: not running - it died {len(rs.get('crashes') or [])} times within "
+                         f"{float(rs.get('crash_window') or 0):g} s (crash loop, last: {exit_text(rs.get('last_rc'))}) "
+                         f"and was not started again. See {os.path.join(state_dir(), 'watch', 'fault.log')}; "
+                         f"then: dingo-pack watch --daemon")
+        else:
+            lines.append("watch: not running - start it: dingo-pack watch --daemon")
+    guard = read_json(os.path.join(watch_dir(), "guard.json"), {}) or {}
+    if guard:
+        g_age = now() - (guard.get("t") or 0)
+        every = float(guard.get("every") or 60)
+        if guard.get("ok") is False:
+            lines.append(f"guard: could not restore the watch - {guard.get('detail')}")
+        elif g_age > max(3 * every, 300):
+            lines.append(guard_stale_text(g_age, every, pid, st)
+                         + (f" It said on exit: {guard['exited']}." if guard.get("exited") else ""))
+        else:
+            lines.append(f"guard: checking every {every:g} s, has started the watch {guard.get('starts', 0)} time(s)")
+    for name in (st.get("selflock") or []) if pid else []:
+        lines.append(f"  self-locked: session {name} is over its cap and every one of its jobs is paused - "
+                     f"it cannot recover by itself; raise the cap or stop that work")
     for x in (st.get("stalled") or []) if pid else []:
         lines.append("  stalled: " + stall_text(x))
     for r in still_paused(st):
-        lines.append(f"  paused pid {r['pid']} {r.get('session') or '?'} {fmt_size(r.get('rss'))} since {hhmm(r['t'])}"
+        lines.append(f"  paused pid {r['pid']} {r.get('session') or '?'} {fmt_size(r.get('rss'))} since {hhmm(r.get('t') or now())}"
                      f" ({r.get('reason')}) - resume: dingo-pack watch resume {r['pid']}")
     return lines
+
+
+def cmd_stuck(args):
+    """Who is in uninterruptible sleep, and what to do - the question `ps` / `who` cannot answer
+    when they themselves are the readers piling up behind it."""
+    info = kernel_stuck(limit=getattr(args, "limit", 20))
+    if getattr(args, "json", False):
+        print(json.dumps(info, ensure_ascii=False, default=str))
+        return EXIT_OK if not info["total"] else 1
+    if not info["total"]:
+        print("stuck: none - no process is in uninterruptible sleep (state D)")
+        return EXIT_OK
+    print(f"stuck: {info['total']} process(es) in state D, by command:")
+    for k, v in sorted(info["groups"].items(), key=lambda kv: -kv[1]):
+        print(f"  {v:>5}  {k}")
+    print("  reads of their /proc/<pid>/{cmdline,environ,smaps_rollup,statm} block until the kernel lets go;")
+    print("  so `ps`, `top`, `dingo-pack who` and `dingo-pack top` hang too. Read only /proc/<pid>/stat.")
+    for r in info["rows"]:
+        age = f"{r['age_s'] / 60:.1f} min" if r["age_s"] is not None else "?"
+        print(f"  pid {r['pid']} {r['comm']} state {r['state']} age {age} rss {fmt_size(r['rss'])} ppid {r['ppid']}")
+        print(f"        owner: {r['session'] or '?'}")
+        print(f"        syscall: {r['syscall'] or '? (unreadable)'}   wchan: {r['wchan'] or '?'}")
+        if r["fds"]:
+            print("        open: " + ", ".join(r["fds"]))
+        if r["kill_pending"] is True:
+            print("        SIGKILL is queued and has not been delivered: it cannot die until the kernel releases it.")
+        elif r["kill_pending"] is None:
+            print("        SIGKILL state unknown: /proc/<pid>/status would read its memory and may block too."
+                  " A D process cannot die until the kernel releases it, however many signals are sent.")
+    if info["total"] > info["shown"]:
+        print(f"  ... {info['total'] - info['shown']} more (--limit)")
+    return 1
+
+
+def exit_text(rc):
+    """How a process ended, in words: -11 (Popen) and 139 (a shell's $?) are both 'SIGSEGV'."""
+    if rc is None:
+        return "still running"
+    sig = -rc if rc < 0 else (rc - 128 if 128 < rc < 128 + 65 else None)
+    if sig:
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = f"signal {sig}"
+        return f"died of {name} (exit {128 + sig})"
+    if rc == EXIT_WATCH_ODD:
+        return f"exit {rc} (gave up after repeated impossible errors: the interpreter may be corrupt)"
+    return f"exit {rc}"
+
+
+def watch_note(kind, **kw):
+    """An event in watch/events.jsonl and the log, from outside a Watcher (supervisor, guard)."""
+    rec = dict({"t": now(), "kind": kind}, **kw)
+    try:
+        with open(os.path.join(watch_dir(), "events.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    write_log(dict(rec, op="watch"))
+    print(f"[{hhmm(rec['t'])}] watch {kind}: {kw.get('msg', '')}", flush=True)
+
+
+def watch_fault_log(role):
+    """faulthandler into <watch dir>/fault.log: a SIGSEGV / SIGABRT / SIGBUS leaves the Python stack of
+    every thread (once: 119 segfaults and not one stack). One header per start names pid and role;
+    over 1 MB the file is moved to fault.log.1 first. The handle must stay open: returned to keep."""
+    import faulthandler
+    path = os.path.join(watch_dir(), "fault.log")
+    try:
+        if os.path.getsize(path) > MIB:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    try:
+        f = open(path, "a")
+        f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} dingo-pack {role} pid {os.getpid()} "
+                f"(python {sys.version.split()[0]}) started\n")
+        f.flush()
+        faulthandler.enable(file=f, all_threads=True)
+        return f
+    except OSError:
+        return None
+
+
+def respawn_file():
+    return os.path.join(watch_dir(), "respawn.json")
+
+
+def crash_loop_mark():
+    """The respawn record if it says crash-loop and was written since this boot, else None. A reboot is
+    the usual fix for what made the watch crash, so a mark from before it no longer stops a restart."""
+    rs = read_json(respawn_file(), {}) or {}
+    if rs.get("state") != "crash-loop":
+        return None
+    bt = boot_time()
+    if bt and float(rs.get("t") or 0) < bt:
+        return None
+    return rs
+
+
+def stop_supervisor():
+    """SIGTERM the respawn supervisor (it passes it on to its watch and does not restart). pid or None."""
+    rs = read_json(respawn_file(), {}) or {}
+    spid = rs.get("pid")
+    if rs.get("state") != "running" or not spid or not pid_alive(int(spid)) or not watch_identity(int(spid))[0]:
+        return None
+    try:
+        os.kill(int(spid), signal.SIGTERM)
+    except OSError:
+        return None
+    return int(spid)
+
+
+def watch_respawn(args):
+    """`watch --respawn` (what `watch --daemon` starts): run the watch as a child and start it again
+    when it dies, saying how it died; crash_max deaths within crash_window s is a crash loop - write
+    a crash-loop event and stop. The guard covers what this cannot see: a watch that hangs without
+    dying (it stops it, and this supervisor with it), or this supervisor itself gone."""
+    wc = watch_config()
+    child = [sys.executable, os.path.abspath(__file__), "watch"] + (["--dry-run"] if args.dry_run else []) + \
+            (["--interval", str(args.interval)] if args.interval else [])
+    st = {"stop": None, "p": None, "crashes": []}
+
+    def save(state, **kw):
+        try:
+            write_atomic(respawn_file(), json.dumps(dict({"t": now(), "pid": os.getpid(), "state": state,
+                                                          "crashes": st["crashes"], "crash_max": wc["crash_max"],
+                                                          "crash_window": wc["crash_window"]}, **kw)))
+        except OSError:
+            pass
+
+    def on_sig(signum, frame):
+        st["stop"] = signal.Signals(signum).name
+        p = st["p"]
+        if p and p.poll() is None:
+            try:
+                p.send_signal(signal.SIGTERM)
+            except OSError:
+                pass
+    for sg in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sg, on_sig)
+    first = True
+    while not st["stop"]:
+        other, _ = watch_running()
+        if other and first:
+            # `watch stop` returns before the old watch has let go of the lock; a --daemon right
+            # after it must not give up on a watch that is only exiting
+            end = now() + 5.0
+            while other and now() < end and not st["stop"]:
+                time.sleep(0.2)
+                other, _ = watch_running()
+        first = False
+        if other:
+            save("stopped", detail=f"another watch (pid {other}) holds the lock")
+            eprint(f"dingo-pack watch --respawn: another watch (pid {other}) is running; nothing to supervise")
+            return EXIT_OK
+        p = st["p"] = subprocess.Popen(child, stdin=subprocess.DEVNULL, env=dict(os.environ, DINGO_WATCH_CHILD="1"))
+        save("running", child=p.pid)
+        rc = p.wait()
+        if st["stop"]:
+            break
+        if rc == 0:
+            save("stopped", detail="the watch exited normally", last_rc=0)
+            return EXIT_OK
+        if rc == 1:
+            other, _ = watch_running()
+            if other:                      # lost a start race to another watch: not a crash
+                save("stopped", detail=f"another watch (pid {other}) holds the lock")
+                return EXIT_OK
+        t = now()
+        st["crashes"] = [c for c in st["crashes"] if t - c["t"] < wc["crash_window"]] + [{"t": t, "rc": rc}]
+        n = len(st["crashes"])
+        fault = os.path.join(watch_dir(), "fault.log")
+        watch_note("watch-crash", rc=rc, child=p.pid, n=n,
+                   msg=(f"watch pid {p.pid} {exit_text(rc)}; {n} of {wc['crash_max']} within "
+                        f"{wc['crash_window']:g} s" + (f"; Python stack in {fault}" if rc < 0 or rc > 128 else "")))
+        if n >= wc["crash_max"]:
+            watch_note("crash-loop", n=n, rc=rc,
+                       msg=(f"the watch died {n} times within {wc['crash_window']:g} s (last: {exit_text(rc)}); "
+                            f"not starting it again. Look at {fault} and `journalctl -k | grep segfault`, then "
+                            f"start it by hand: dingo-pack watch --daemon"))
+            save("crash-loop", last_rc=rc)
+            return 1
+        end = now() + wc["respawn_delay"]
+        while not st["stop"] and now() < end:
+            time.sleep(0.1)
+    save("stopped", detail=f"stopped by {st['stop']}")
+    return EXIT_OK
 
 
 def cmd_watch(args):
@@ -4856,6 +5586,9 @@ def cmd_watch(args):
                 print(f"  [{hhmm(e['t'])}] {e['kind']}: {e.get('msg', '')[:160]}")
         return EXIT_OK
     if action == "stop":
+        spid = stop_supervisor()                 # first, so it does not start the watch again
+        if spid:
+            print(f"stopped the respawn supervisor (pid {spid})")
         pid, _ = watch_running()
         if not pid:
             print("watch is not running")
@@ -4863,6 +5596,88 @@ def cmd_watch(args):
         os.kill(int(pid), signal.SIGTERM)
         print(f"stopped watch (pid {pid}); paused jobs stay paused - see dingo-pack watch status")
         return EXIT_OK
+    if action == "guard":
+        # A guard cannot report its own death: if it is killed (or segfaults - a WSL machine did that
+        # repeatedly) nothing restarts it and nobody notices. This loop is the
+        # outside heartbeat: every `--every` seconds, if no watch holds the lock or its last scan
+        # is older than 3 intervals (min 2 min), start it again and log one line.
+        every = float(getattr(args, "every", None) or 60)
+        gf = os.path.join(wd, "guard.json")
+        once = getattr(args, "once", False)
+        fault = None if once else watch_fault_log("watch guard")   # noqa: F841 - kept open for faulthandler
+        g = {"starts": 0, "ok": True, "detail": "watch is scanning", "logged": None}
+
+        class GuardSignal(BaseException):
+            pass
+
+        def on_sig(signum, frame):
+            raise GuardSignal(signal.Signals(signum).name)
+        if not once:
+            for sg in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(sg, on_sig)
+
+        def save(**extra):
+            try:
+                write_atomic(gf, json.dumps(dict({"t": now(), "pid": os.getpid(), "starts": g["starts"], "every": every,
+                                                  "ok": g["ok"], "detail": g["detail"]}, **extra)))
+            except OSError:
+                pass
+
+        def check_once():
+            pid, st = watch_running()
+            age = now() - (st.get("t") or 0)
+            stale = guard_decision(pid, age, st.get("interval") or 2) == "restart"
+            g["ok"], g["detail"] = True, "watch is scanning"
+            rs = crash_loop_mark() or {}
+            if stale and not pid and rs:
+                # restarting it would only crash again: leave it to a person, and say it once in the log
+                g["ok"] = False
+                g["detail"] = (f"the watch is in a crash loop ({len(rs.get('crashes') or [])} deaths within "
+                               f"{float(rs.get('crash_window') or 0):g} s, last: {exit_text(rs.get('last_rc'))}); "
+                               f"not starting it again - look at {os.path.join(wd, 'fault.log')}, then: "
+                               f"dingo-pack watch --daemon")
+                if g["logged"] != rs.get("t"):
+                    g["logged"] = rs.get("t")
+                    eprint(f"dingo-pack watch guard: {g['detail']}")
+                    write_log({"t": now(), "op": "watch-guard", "ok": False, "starts": g["starts"],
+                               "detail": g["detail"]})
+            elif stale:
+                eprint(("dingo-pack watch guard: watch is not running; starting it" if not pid else
+                        f"dingo-pack watch guard: watch (pid {pid}) has not scanned for {age / 60:.1f} min; "
+                        f"stopping it and starting a new one"))
+                g["ok"], g["detail"] = guard_restart(pid, st.get("t") or 0)
+                eprint(f"dingo-pack watch guard: {g['detail']}")
+                if g["ok"]:
+                    g["starts"] += 1
+                write_log({"t": now(), "op": "watch-guard", "ok": g["ok"], "starts": g["starts"],
+                           "was_pid": pid, "was_age_s": round(age), "detail": g["detail"]})
+            save()
+
+        why, sig = None, None
+        try:
+            while True:
+                check_once()
+                if once:
+                    return EXIT_OK if g["ok"] else 1
+                time.sleep(every)
+        except GuardSignal as e:
+            sig = str(e)
+            why = f"stopped by {sig}"
+            return EXIT_OK
+        except BaseException as e:               # noqa: BLE001 - say why, then die as before
+            why = f"crashed: {e!r}"[:300]
+            raise
+        finally:
+            # A guard that stops says so: one died silently once and stayed STALE for nine days.
+            # (SIGKILL cannot be caught; a SIGSEGV leaves its stack in fault.log.)
+            if why:
+                rec = {"t": now(), "op": "watch-guard-exit", "pid": os.getpid(), "why": why, "starts": g["starts"]}
+                if sig:
+                    rec["signal"] = sig
+                write_log(rec)
+                eprint(f"dingo-pack watch guard: exiting - {why}")
+                save(exited=f"{hhmm(now())} {why}")
+
     if action == "resume":
         # Under the control lock, so two `watch resume` calls and the watch's own scan cannot overwrite
         # each other's view. A manual resume neither counts against nor resets max_auto_resumes.
@@ -4901,8 +5716,11 @@ def cmd_watch(args):
             print("nothing to resume")
         return EXIT_OK
     # run
+    if args.respawn and not args.daemon:
+        return watch_respawn(args)
     if args.daemon:
-        exe = [sys.executable, os.path.abspath(__file__), "watch"] + (["--dry-run"] if args.dry_run else []) + \
+        # the watch runs under `watch --respawn`, which restarts it when it dies (see watch_respawn)
+        exe = [sys.executable, os.path.abspath(__file__), "watch", "--respawn"] + (["--dry-run"] if args.dry_run else []) + \
               (["--interval", str(args.interval)] if args.interval else [])
         logf = open(os.path.join(wd, "watch.out"), "a")
         p = subprocess.Popen(exe, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL, start_new_session=True,
@@ -4917,10 +5735,29 @@ def cmd_watch(args):
         pid, _ = watch_running()
         eprint(f"dingo-pack watch: already running (pid {pid})")
         return 1
+    fault = watch_fault_log("watch")   # noqa: F841 - kept open for faulthandler
     wc = watch_config()
     if args.interval:
         wc["interval"] = args.interval
     w = Watcher(wc, dry_run=args.dry_run, out=sys.stdout)
+    odd = []
+
+    def odd_error(e):
+        """TypeError / KeyError / SystemError cannot come out of the memory scan (step) with sane values: two in a
+        minute means the interpreter itself may be corrupt. Stop deciding pauses and kills in it."""
+        if not isinstance(e, (TypeError, KeyError, SystemError)):
+            return
+        t = now()
+        odd[:] = [x for x in odd if t - x < wc["odd_window"]] + [t]
+        if len(odd) >= wc["odd_max"]:
+            try:
+                w.event("odd-errors", n=len(odd), error=repr(e)[:200],
+                        msg=(f"{len(odd)} impossible errors within {wc['odd_window']:g} s (last {e!r:.120}); "
+                             f"the interpreter may be corrupt - exiting so a fresh watch takes over"))
+            finally:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(EXIT_WATCH_ODD)
     stop = {"now": False}
     signal.signal(signal.SIGTERM, lambda s, f: stop.update(now=True))
     signal.signal(signal.SIGINT, lambda s, f: stop.update(now=True))
@@ -4937,11 +5774,12 @@ def cmd_watch(args):
         try:
             w.stall_scan()
         except Exception as e:                           # noqa: BLE001
-            eprint(f"dingo-pack watch: status-line check failed: {e!r}")
+            eprint(f"dingo-pack watch: status-line check failed: {e!r}")   # side feature: never counted as odd
         try:
             w.step()
         except Exception as e:                           # noqa: BLE001 - a guard must keep guarding
             eprint(f"dingo-pack watch: scan failed: {e!r}")
+            odd_error(e)
         n += 1
         if args.once or (args.scans and n >= args.scans):
             break
@@ -5029,9 +5867,12 @@ def main(argv=None):
     q.add_argument("--threads", type=int, help="CPU threads this job may use (sets OMP_NUM_THREADS etc.; "
                    "takes that many CPU slots; default 8 heavy, 1 io)")
     q.add_argument("--mem", type=parse_size, help="expected peak memory, e.g. 6G (default 1G; configurable)")
-    q.add_argument("--limit", type=parse_size, help="per-process limit (default 1.5 x --mem; 0 = none)")
+    q.add_argument("--limit", type=parse_size,
+                   help="per-process cap on virtual size, RLIMIT_DATA/AS (default: none; counts address space, "
+                        "not RSS - importing numpy maps ~1.1G while using 27M)")
     q.add_argument("--limit-kind", choices=("data", "as"), default="data")
-    q.add_argument("--tree-limit", type=parse_size, help="limit on the whole process tree (default = --limit; 0 = none)")
+    q.add_argument("--tree-limit", type=parse_size,
+                   help="limit on the whole process tree, measured by PSS/RSS (default 1.5 x --mem, or --limit when that is given; 0 = none)")
     q.add_argument("cmd", nargs=argparse.REMAINDER)
 
     q = sp.add_parser("lease", help="hold a slot for work that is not a shell command")
@@ -5046,15 +5887,23 @@ def main(argv=None):
     q.add_argument("--session")
     q.add_argument("ids", nargs="*")
 
+    q = sp.add_parser("stuck", help="who is stuck in the kernel (state D), what they hold, and whether SIGKILL is already waiting")
+    q.add_argument("--limit", type=int, default=20, help="how many to list (default 20)")
+    q.add_argument("--json", action="store_true")
+
     q = sp.add_parser("watch", help="live memory guard: warn, pause (SIGSTOP) the biggest / fastest-growing job, kill only at the edge")
-    q.add_argument("action", nargs="?", choices=("run", "status", "stop", "resume"), default="run")
+    q.add_argument("action", nargs="?", choices=("run", "status", "stop", "resume", "guard"), default="run")
     q.add_argument("pids", nargs="*", help="resume: pids (default all)")
-    q.add_argument("--daemon", action="store_true", help="start in the background and return")
+    q.add_argument("--daemon", action="store_true",
+                   help="start in the background (under --respawn) and return")
+    q.add_argument("--respawn", action="store_true",
+                   help="run the watch as a child and restart it when it dies; stop after crash_max deaths in crash_window s")
     q.add_argument("--dry-run", action="store_true", help="alerts only: never pause or kill")
     q.add_argument("--once", action="store_true", help="one scan, then exit")
     q.add_argument("--scans", type=int, help="stop after this many scans")
     q.add_argument("--interval", type=float, help="seconds between scans (default 2)")
     q.add_argument("--json", action="store_true")
+    q.add_argument("--every", type=float, help="guard: seconds between checks (default 60)")
     q.add_argument("--session")
 
     q = sp.add_parser("session", help="start an agent as a named session with a memory cap: session --name X --max 8G -- claude")
@@ -5236,7 +6085,7 @@ def main(argv=None):
           "top": cmd_top, "close-all": cmd_close_all, "restore": cmd_restore, "board": cmd_board,
           "name": cmd_name, "card": cmd_card, "lint": cmd_lint, "queue": cmd_queue, "claim": cmd_claim,
           "boxes": cmd_boxes, "_probe": cmd_probe, "tokens": cmd_tokens,
-          "adapter": cmd_adapter, "watch": cmd_watch, "session": cmd_session}.get(args.sub)
+          "adapter": cmd_adapter, "watch": cmd_watch, "session": cmd_session, "stuck": cmd_stuck}.get(args.sub)
     if not fn:
         return cmd_overview(args)
     return fn(args)

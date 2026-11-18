@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""开-013 R2: dingo 0.5 shrink. Moving commands still work and say where they go; bulk close and
+"""dingo 0.5 shrink. Moving commands still work and say where they go; bulk close and
 opening terminal tabs say they are no longer maintained; the core stays quiet.
 
 Private DINGO_HOME / DINGO_CLAUDE_HOME / DINGO_CONFIG. close-all, stow, boxes and opening tabs are

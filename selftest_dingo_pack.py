@@ -308,8 +308,8 @@ def t_memory_liar(E):
     hog = hog_file(E)
     m = Machine(E, 350 * MB)
     env = {"DINGO_FAKE_MEMINFO": m.meminfo, "DINGO_RESERVE": "25M", "DINGO_MEM_POLL_S": "0.2"}
-    # tree limit off: this checks the per-process limit alone
-    liar = E.popen("run", "--heavy", "--mem", "60M", "--tree-limit", "0", "--", PY, hog, "300", "0.5", env=env)
+    # tree limit off: this checks the per-process limit alone (--limit is opt-in since 0.5.1)
+    liar = E.popen("run", "--heavy", "--mem", "60M", "--limit", "90M", "--tree-limit", "0", "--", PY, hog, "300", "0.5", env=env)
     m.roots.append(liar.pid)
     time.sleep(0.1)
     honest = []
@@ -321,6 +321,30 @@ def t_memory_liar(E):
     m.close()
     check("limit: a job over its own limit fails by itself (MemoryError), honest ones finish",
           rl not in (0, 137) and rh == [0, 0] and not m.kills, f"liar rc {rl}, honest {rh}, kills {len(m.kills)}")
+    # No per-process cap by default: RLIMIT_DATA counts address space, and importing numpy maps
+    # ~1.1 GB while RSS is ~27 MB, so a 1.5 x --mem default killed correct jobs (measured).
+    mapper = E.path("mapper.py")
+    with open(mapper, "w") as f:
+        f.write("import ctypes, ctypes.util, mmap, sys\n"
+                "N = 1024 * 1024 * 1024          # 1 GiB reserved, never touched\n"
+                "try:\n"
+                "    m = mmap.mmap(-1, N)\n"              # some WSL builds answer EBADF here
+                "except OSError:\n"
+                "    libc = ctypes.CDLL(ctypes.util.find_library('c') or 'libc.so.6', use_errno=True)\n"
+                "    libc.mmap.restype = ctypes.c_void_p\n"
+                "    p = libc.mmap(None, N, 3, 0x22, -1, 0)   # PROT_READ|WRITE, PRIVATE|ANONYMOUS\n"
+                "    if p in (None, ctypes.c_void_p(-1).value):\n"
+                "        print('SKIP', ctypes.get_errno()); sys.exit(0)\n"
+                "import resource\n"
+                "print('N', N, 'RLIMIT_DATA', resource.getrlimit(resource.RLIMIT_DATA)[0])\n")
+    # --limit is NOT passed: this is the default path (omitting it is the point).
+    r = E.run("run", "--heavy", "--mem", "60M", "--tree-limit", "0", "--", PY, mapper, env=env)
+    if r.returncode == 0 and r.stdout.strip().startswith("SKIP"):
+        check("limit: no per-process cap by default (skipped: cannot reserve address space here)", True, r.stdout)
+    else:
+        check("limit: no per-process cap unless asked - child sees RLIMIT_DATA unlimited and keeps 1 GiB reserved",
+              r.returncode == 0 and "N 1073741824" in r.stdout and "RLIMIT_DATA -1" in r.stdout,
+              f"rc {r.returncode}, {r.stdout[-200:]}, {r.stderr[-200:]}")
 
 
 def t_tree_limit(E):
@@ -780,8 +804,9 @@ def t_doctor(E):
 
 def _spawn(env_extra, ignore_hup=False):
     def pre():
-        if ignore_hup:
-            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        # Be explicit both ways: if the self-test itself runs under nohup / setsid, every child
+        # would inherit SIG_IGN and look "detached" (the ghosts checks would go red for no reason).
+        signal.signal(signal.SIGHUP, signal.SIG_IGN if ignore_hup else signal.SIG_DFL)
     env = dict(os.environ, DINGO_SCOPE_TAG=SCOPE, **env_extra)
     return subprocess.Popen(["sleep", "60"], env=env, preexec_fn=pre)
 
@@ -1887,8 +1912,887 @@ def t_claim_review(E):
     check("claim add: six adds for the same card at once -> exactly one line", n == 1, open(h).read())
 
 
-TESTS = [t_names_cards, t_queue, t_claims, t_claim_freeform, t_claim_release, t_claim_review, t_boxes, t_probe_readonly, t_tasks, t_adapters, t_board, t_cpu, t_backfill, t_peak_commit, t_turnover, t_ghost_format, t_io_lane, t_who_json, t_overview_top, t_doctor, t_ghosts, t_stow, t_stow_race, t_shared_pages, t_grandchild, t_fallback_roster, t_hint, t_slots, t_fifo, t_kill_releases, t_exitcodes, t_fits, t_memory_pack, t_memory_liar, t_tree_limit,
-         t_lease, t_roster, t_hook, t_local_state]
+def t_kernel_stuck(E):
+    """A process stuck in the kernel (state D) must not hang stuck / who / top / watch, and must be
+    reported. The fake /proc has real FIFOs where cmdline / environ / smaps / status would be: a
+    read of those blocks forever, exactly like a read of a D process."""
+    root = E.path("proc")
+    os.makedirs(os.path.join(root, "self"), exist_ok=True)
+
+    def mk(pid, comm, state="S", ppid=1, blocking=(), rss=40):
+        d = os.path.join(root, str(pid))
+        os.makedirs(os.path.join(d, "fd"), exist_ok=True)
+        f = [state, str(ppid), str(pid), str(pid), "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
+             "20", "0", "1", "0", "1000", "2000000", str(rss)]
+        with open(os.path.join(d, "stat"), "w") as fh:
+            fh.write(f"{pid} ({comm}) " + " ".join(f) + "\n")
+        for name in ("cmdline", "environ", "smaps_rollup", "status"):
+            p = os.path.join(d, name)
+            if name in blocking:
+                os.mkfifo(p)
+            else:
+                with open(p, "w") as fh:
+                    fh.write("")
+        for name in ("syscall", "wchan"):
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write("12 0x0 0x0\n" if name == "syscall" else "0\n")
+        with open(os.path.join(d, "fd", "3"), "w") as fh:
+            fh.write("x")
+
+    mk(900, "python3", "S", 1)
+    mk(901, "python3", "D", 900, blocking=("cmdline", "environ", "smaps_rollup", "status"))
+    env = {"DINGO_FAKE_PROC": root, "DINGO_SCOPE_TAG": ""}
+    t0 = time.time()
+    r = E.run("stuck", "--json", env=env, timeout=30)
+    dt = time.time() - t0
+    try:
+        info = json.loads(r.stdout)
+    except ValueError:
+        info = {}
+    check("stuck: one process in state D is named, and the read does not hang (FIFOs instead of "
+          "cmdline / environ / smaps)", dt < 15 and r.returncode == 1 and info.get("total") == 1
+          and info["rows"][0]["pid"] == 901 and info["rows"][0]["kill_pending"] is None,
+          f"rc {r.returncode} in {dt:.1f}s, {r.stdout[:300]} {r.stderr[-200:]}")
+    n0 = len([x for x in os.listdir(os.path.join(root, "901", "fd"))])
+    check("stuck: fd numbers are listed, their targets are not read (readlink can block too)", n0 == 1, str(n0))
+    t0 = time.time()
+    r = E.run("watch", "--once", env=env, timeout=30)
+    dt = time.time() - t0
+    st = {}
+    try:
+        with open(E.path("state", "watch", "status.json")) as f:
+            st = json.load(f)
+    except OSError:
+        pass
+    check("watch: a D process is skipped, not read - the scan finishes and status.json names it",
+          dt < 15 and st.get("blocked_total") == 1 and st.get("blocked_groups") == {"python3": 1},
+          f"{dt:.1f}s, {st.get('blocked_total')}, {st.get('blocked_groups')}")
+    t0 = time.time()
+    w = E.run("who", "--json", env=env, timeout=60)
+    dt = time.time() - t0
+    check("who: still answers with a D process present", w.returncode == 0 and dt < 30,
+          f"rc {w.returncode} in {dt:.1f}s {w.stderr[-200:]}")
+    # a watch whose last scan is old is reported as stuck, not as healthy.
+    # It must also still hold the lifetime lock, as a hung watcher does: hold it here.
+    import fcntl
+    st.update(pid=os.getpid(), t=time.time() - 900, interval=2)
+    with open(E.path("state", "watch", "status.json"), "w") as f:
+        json.dump(st, f)
+    lock = open(E.path("state", "watch", "lock"), "a+")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        r = E.run("watch", "status", env=env, timeout=30)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    check("watch status: an old scan timestamp is reported as STUCK (the guard cannot report its own hang)",
+          "STUCK" in r.stdout, r.stdout[:300])
+    # the *common* readers (top / ghosts / task list) must not open a D
+    # process's memory files either, and a timed-out read must not spawn a new blocked thread
+    # every scan. Normals: 900 (S, FIFOs with a writer? no) - use pid 902 for the dedupe case.
+    mk(902, "python3", "S", 1, blocking=("cmdline",))
+    probe = E.path("reader_probe.py")
+    with open(probe, "w") as f:
+        f.write("import importlib.util, os, sys, threading, time\n"
+                "from importlib.machinery import SourceFileLoader\n"
+                "ld = SourceFileLoader('dp', sys.argv[1])\n"
+                "spec = importlib.util.spec_from_loader('dp', ld)\n"
+                "m = importlib.util.module_from_spec(spec); ld.exec_module(m)\n"
+                "d_pid, slow_pid = int(sys.argv[2]), int(sys.argv[3])\n"
+                "before = threading.active_count()\n"
+                "t0 = time.time()\n"
+                "for _ in range(5):\n"
+                "    for fn in (m.proc_cmdline, m.proc_environ, m.proc_pss, m.proc_detached):\n"
+                "        fn(d_pid)\n"
+                "dt_d = time.time() - t0\n"
+                "n_d = threading.active_count() - before\n"
+                "m.proc_cmdline(slow_pid)                     # blocks, times out once (leaks 1 thread)\n"
+                "n1 = threading.active_count() - before\n"
+                "for _ in range(5):\n"
+                "    m.proc_cmdline(slow_pid)                 # must be remembered: no new readers\n"
+                "print('D', round(dt_d, 3), n_d, 'slow', n1, threading.active_count() - before)\n")
+    env2 = dict(env, DINGO_PROC_TIMEOUT="0.05")
+    t0 = time.time()
+    r = subprocess.run([PY, probe, E.tool, "901", "902"], env=dict(E.env, **env2),
+                       capture_output=True, text=True, timeout=60)
+    dt = time.time() - t0
+    parts = r.stdout.split()
+    try:
+        d_dt, n_d, n1, n_after = float(parts[1]), int(parts[2]), int(parts[4]), int(parts[5])
+    except (IndexError, ValueError):
+        d_dt = n_d = n1 = n_after = -1
+    check("readers: top / ghosts / task-list paths never open a D process's memory files "
+          "(5 rounds, zero blocked threads, well under a second)",
+          r.returncode == 0 and n_d == 0 and d_dt < 1.0, (r.stdout.strip(), r.stderr[-200:]))
+    check("readers: a read that timed out once is not tried again - the blocked-thread count stays put",
+          n1 == 1 and n_after == 1 and dt < 30, f"n1 {n1}, after 5 more {n_after}, {dt:.1f}s")
+
+
+def t_selflock_gate(E):
+    """A session over its cap whose every job is paused cannot recover by itself; waiting for it
+    must not block the whole machine (seen: 15 minutes of WAIT for one self-locked session)."""
+    import fcntl
+    wd = E.path("state", "watch")
+    os.makedirs(wd, exist_ok=True)
+    sleeper = subprocess.Popen(["sleep", "60"])
+    st = proc_start(sleeper.pid)
+    os.kill(sleeper.pid, signal.SIGSTOP)
+    try:
+        rec = {"pid": sleeper.pid, "start": st, "session": "selflocked", "rss": 1 << 20, "why": "session"}
+        status = {"t": time.time(), "pid": os.getpid(), "interval": 2, "level": "stop",
+                  "stopped": [rec], "selflock": ["selflocked"], "sessions": []}
+        with open(os.path.join(wd, "status.json"), "w") as f:
+            json.dump(status, f)
+        lock = open(os.path.join(wd, "lock"), "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            ok = E.run("who", "--gate", "--need", "1M", timeout=60)
+            lines = E.run("watch", "status", timeout=60)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        check("gate: a paused job of a self-locked session does not hold the machine at WAIT",
+              ok.returncode == 0 and "self-locked" in ok.stdout + lines.stdout,
+              (ok.returncode, ok.stdout[-300:], lines.stdout[-200:]))
+        status["selflock"] = []
+        with open(os.path.join(wd, "status.json"), "w") as f:
+            json.dump(status, f)
+        lock = open(os.path.join(wd, "lock"), "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            wait = E.run("who", "--gate", "--need", "1M", timeout=60)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        check("gate: a paused job that is NOT self-locked still holds it at WAIT",
+              wait.returncode == 1 and "WAIT" in wait.stdout, (wait.returncode, wait.stdout[-200:]))
+    finally:
+        try:
+            os.kill(sleeper.pid, signal.SIGCONT)
+        except OSError:
+            pass
+        sleeper.kill()
+        sleeper.wait()
+
+
+def t_watch_guard(E):
+    """The guard is the outside heartbeat: no watch (or a stale one) -> start it, and say so."""
+    probe = E.path("guard_decision.py")
+    with open(probe, "w") as f:
+        f.write("import importlib.util, sys\n"
+                "from importlib.machinery import SourceFileLoader\n"
+                "ld = SourceFileLoader('dp', sys.argv[1]); spec = importlib.util.spec_from_loader('dp', ld)\n"
+                "m = importlib.util.module_from_spec(spec); ld.exec_module(m)\n"
+                "print(m.guard_decision(None, 0, 2), m.guard_decision(1, 30, 2), m.guard_decision(1, 300, 2))\n")
+    r0 = subprocess.run([PY, probe, E.tool], env=E.env, capture_output=True, text=True, timeout=60)
+    check("guard: decision - no watch -> restart, fresh -> ok, stale -> restart",
+          r0.stdout.split() == ["restart", "ok", "restart"], r0.stdout + r0.stderr[-200:])
+    r = E.run("watch", "guard", "--once", "--every", "5", timeout=90)
+    g = {}
+    try:
+        with open(E.path("state", "watch", "guard.json")) as f:
+            g = json.load(f)
+    except OSError:
+        pass
+    watch_up = E.run("watch", "status", timeout=30).stdout
+    E.run("watch", "stop", timeout=30)
+    check("guard: --once starts a watch that was not running and records it",
+          r.returncode == 0 and g.get("starts") == 1 and "not running" in r.stderr,
+          (r.returncode, r.stderr[-200:], g))
+    check("guard: the started watch is running and scanning", "running" in watch_up, watch_up[:200])
+
+    # P1-1: a watch that holds the lock but stopped scanning must really be replaced, not
+    # "restarted" into an immediate "already running".
+    E.run("watch", "--daemon", timeout=60)
+    time.sleep(1.5)
+    pid, _ = E.run("watch", "status", "--json", timeout=30).stdout, None
+    try:
+        st = json.loads(pid)
+        wpid = int(st["pid"])
+    except (ValueError, KeyError):
+        wpid = 0
+    os.kill(wpid, signal.SIGSTOP)                 # hung: alive, holds the lock, no new scans
+    try:
+        stf = E.path("state", "watch", "status.json")
+        with open(stf) as f:
+            doc = json.load(f)
+        doc["t"] = time.time() - 900
+        with open(stf, "w") as f:
+            json.dump(doc, f)
+        r2 = E.run("watch", "guard", "--once", "--every", "5", timeout=90)
+        st2 = E.run("watch", "status", "--json", timeout=30).stdout
+        try:
+            newpid = int(json.loads(st2)["pid"]) if st2.strip() else 0
+        except (ValueError, KeyError):
+            newpid = 0
+        g2 = {}
+        try:
+            with open(E.path("state", "watch", "guard.json")) as f:
+                g2 = json.load(f)
+        except OSError:
+            pass
+        check("guard: a stale watch that still holds the lock is stopped and replaced "
+              "(not left as 'already running')",
+              r2.returncode == 0 and newpid and newpid != wpid and g2.get("ok") is True
+              and "stopped the stale watch" in (g2.get("detail") or ""),
+              (r2.returncode, r2.stderr[-300:], wpid, newpid, g2))
+    finally:
+        try:
+            os.kill(wpid, signal.SIGKILL)
+        except OSError:
+            pass
+        E.run("watch", "stop", timeout=30)
+    # a lock held by something that is not our watch: refuse, do not pretend
+    for _ in range(40):                       # let the previous watch really exit first
+        if "running" not in E.run("watch", "status", timeout=30).stdout:
+            break
+        time.sleep(0.25)
+    fake = subprocess.Popen(["sleep", "60"])
+    lock = open(E.path("state", "watch", "lock"), "a+")
+    import fcntl as _fcntl
+    _fcntl.flock(lock, _fcntl.LOCK_EX)
+    try:
+        with open(E.path("state", "watch", "status.json"), "w") as f:
+            json.dump({"t": time.time() - 900, "pid": fake.pid, "interval": 2, "level": "ok"}, f)
+        r3 = E.run("watch", "guard", "--once", "--every", "5", timeout=60)
+        g3 = {}
+        try:
+            with open(E.path("state", "watch", "guard.json")) as f:
+                g3 = json.load(f)
+        except OSError:
+            pass
+        check("guard: a lock held by a process that is not our watch is reported, not counted as restored",
+              r3.returncode == 1 and g3.get("ok") is False and "not a dingo-pack watch" in (g3.get("detail") or ""),
+              (r3.returncode, r3.stderr[-300:], g3))
+        # the same, but the intruder's command line *contains* both words: a substring test would
+        # have killed it. It must be left alone.
+        sp = E.path("spoof.py")
+        with open(sp, "w") as f:
+            f.write("import fcntl, sys, time\n"
+                    "f = open(sys.argv[1], 'a+')\n"
+                    "fcntl.flock(f, fcntl.LOCK_EX)\n"
+                    "time.sleep(60)\n")
+        spoof = subprocess.Popen([PY, sp, os.path.join(E.path("state", "watch", "lock")),
+                                  "dingo-pack", "watch"])
+        try:
+            for _ in range(40):
+                lockp = os.path.join(E.path("state", "watch", "lock"))
+                holder_ok = False
+                try:
+                    ino = os.stat(lockp)
+                    for fd in os.listdir(f"/proc/{spoof.pid}/fd"):
+                        st = os.stat(f"/proc/{spoof.pid}/fd/{fd}")
+                        if (st.st_dev, st.st_ino) == (ino.st_dev, ino.st_ino):
+                            holder_ok = True
+                except OSError:
+                    holder_ok = False
+                if holder_ok:
+                    break
+                time.sleep(0.1)
+            with open(E.path("state", "watch", "status.json"), "w") as f:
+                json.dump({"t": time.time() - 900, "pid": spoof.pid, "interval": 2, "level": "ok"}, f)
+            r4 = E.run("watch", "guard", "--once", "--every", "5", timeout=60)
+            g4 = {}
+            try:
+                with open(E.path("state", "watch", "guard.json")) as f:
+                    g4 = json.load(f)
+            except OSError:
+                pass
+            check("guard: 'dingo-pack' and 'watch' in a command line are not enough - the real lock "
+                  "holder is checked by argv and by the lock inode, and a fake is not signalled",
+                  r4.returncode == 1 and g4.get("ok") is False and spoof.poll() is None,
+                  (r4.returncode, r4.stderr[-300:], g4, spoof.poll()))
+        finally:
+            spoof.kill()
+            spoof.wait()
+    finally:
+        _fcntl.flock(lock, _fcntl.LOCK_UN)
+        lock.close()
+        fake.kill()
+        fake.wait()
+    # an observer that merely keeps the lock file open (no flock) must not block recovery:
+    # it is not the lock holder, whatever status.json says
+    obs = subprocess.Popen([PY, "-c", "import sys,time;f=open(sys.argv[1]);time.sleep(60)",
+                            os.path.join(E.path("state", "watch", "lock"))])
+    try:
+        time.sleep(0.6)
+        with open(E.path("state", "watch", "status.json"), "w") as f:
+            json.dump({"t": time.time() - 900, "pid": obs.pid, "interval": 2, "level": "ok"}, f)
+        r5 = E.run("watch", "guard", "--once", "--every", "5", timeout=90)
+        g5 = {}
+        try:
+            with open(E.path("state", "watch", "guard.json")) as f:
+                g5 = json.load(f)
+        except OSError:
+            pass
+        st5 = E.run("watch", "status", "--json", timeout=30).stdout
+        try:
+            newpid5 = int(json.loads(st5)["pid"]) if st5.strip() else 0
+        except (ValueError, KeyError):
+            newpid5 = 0
+        check("guard: a process that only has the lock file open (no flock) is not the lock "
+              "holder - the watch is still restarted",
+              r5.returncode == 0 and g5.get("ok") is True and newpid5 and newpid5 != obs.pid,
+              (r5.returncode, r5.stderr[-300:], g5, newpid5, obs.pid))
+    finally:
+        obs.kill()
+        obs.wait()
+        E.run("watch", "stop", timeout=30)
+
+
+def t_cleanup_race(E):
+    """R2-P1-1: a late environ read from one pid must never be credited to the next, and a pid
+    whose read is still in flight may not be signalled at all."""
+    probe = E.path("cleanup_probe.py")
+    with open(probe, "w") as f:
+        f.write("import builtins, importlib.util, io, os, sys, time\n"
+                "from importlib.machinery import SourceFileLoader\n"
+                "ld = SourceFileLoader('sw', sys.argv[1])\n"
+                "spec = importlib.util.spec_from_loader('sw', ld)\n"
+                "sw = importlib.util.module_from_spec(spec); ld.exec_module(sw)\n"
+                "sw.TAG = 'T'\n"
+                "DELAY = {'100': 0.36, '200': 1.0, '300': 0.0}      # 100 and 200 come back too late\n"
+                "ENV = {'100': b'DINGO_SCOPE_TAG=T\\0', '200': b'OTHER=1\\0', '300': b'DINGO_SCOPE_TAG=T\\0'}\n"
+                "kills = []\n"
+                "real_open = builtins.open\n"
+                "def fake_open(path, *a, **k):\n"
+                "    p = str(path)\n"
+                "    for pid in ENV:\n"
+                "        if p == '/proc/%s/environ' % pid:\n"
+                "            time.sleep(DELAY[pid]); return io.BytesIO(ENV[pid])\n"
+                "        if p == '/proc/%s/stat' % pid:\n"
+                "            return io.StringIO('%s (x) S 1 %s %s 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 1000 2000000 40\\n' % (pid, pid, pid))\n"
+                "    return real_open(path, *a, **k)\n"
+                "builtins.open = fake_open\n"
+                "sw.os.listdir = lambda d: ['100', '200', '300', 'self']\n"
+                "sw.os.kill = lambda pid, sig: kills.append(pid)\n"
+                "sw.cleanup(budget_s=3.0)\n"
+                "builtins.open = real_open\n"
+                "print('kills', kills)\n")
+    watch_src = os.path.join(HERE, "selftest_watch.py")
+    r = subprocess.run([PY, probe, watch_src], env=E.env, capture_output=True, text=True, timeout=60)
+    check("cleanup: one pid's late environ never lands in the next pid's box - only the fast tagged "
+          "pid is signalled, the two slow/other ones are never",
+          r.returncode == 0 and "[300]" in r.stdout, (r.stdout.strip(), r.stderr[-300:]))
+
+
+def t_read_cache(E):
+    """R2-P1-2: a timed-out read must never be dropped from the cache while its reader may still be
+    blocked. At the cap, open nothing new and answer unknown instead of buying more readers."""
+    probe = E.path("cache_probe.py")
+    with open(probe, "w") as f:
+        f.write("import importlib.util, sys\n"
+                "from importlib.machinery import SourceFileLoader\n"
+                "ld = SourceFileLoader('dp', sys.argv[1])\n"
+                "spec = importlib.util.spec_from_loader('dp', ld)\n"
+                "m = importlib.util.module_from_spec(spec); ld.exec_module(m)\n"
+                "calls = [0]\n"
+                "def fake_timed(fn, timeout):\n"
+                "    calls[0] += 1\n"
+                "    return ('timeout', None)\n"
+                "m.run_timed = fake_timed\n"
+                "m.proc_stat = lambda pid: {'state': 'S', 'start': 1000, 'comm': 'x', 'ppid': 1, 'rss': 4096, 'sid': 1}\n"
+                "m.READ_STUCK_MAX = 1000\n"
+                "for pid in range(1, 515):\n"
+                "    m.proc_read(pid, 'cmdline')\n"
+                "n1, c1 = len(m._READ_STUCK), calls[0]\n"
+                "m.proc_read(1, 'cmdline')             # the oldest: must not reopen\n"
+                "m.proc_read(500, 'cmdline')           # a late one: same\n"
+                "c2 = calls[0]\n"
+                "m.READ_STUCK_MAX = 512\n"
+                "m.proc_read(999, 'cmdline')            # over the cap: unknown, no new reader\n"
+                "print('RESULT', n1, c1, c2, calls[0], len(m._READ_STUCK))\n")
+    r = subprocess.run([PY, probe, E.tool], env=dict(E.env, TMPDIR=E.base), capture_output=True, text=True, timeout=90)
+    parts = r.stdout.split()
+    try:
+        n1, c1, c2, c3, n2 = (int(x) for x in parts[1:6])
+    except (IndexError, ValueError):
+        n1 = c1 = c2 = c3 = n2 = -1
+    check("read cache: 514 timed-out reads are all kept (nothing evicted), re-reading the oldest or "
+          "a late one creates no new reader, and at the cap nothing new is opened",
+          r.returncode == 0 and n1 == 514 and c1 == 514 and c2 == 514 and c3 == 514 and n2 == 514,
+          (r.stdout.strip(), r.stderr[-300:]))
+
+
+def t_stuck_threshold(E):
+    """kernel-stuck is alerted only after a process has been in D for stuck_secs (default
+    30 s), and a D on a network / 9p disk (wchan p9_client_rpc ...) is counted and alerted only past stuck_net_secs.
+    Over three days the old alert fired 14 252 times, 13 425 of them for "D 0 s", 11 766 on 9p."""
+    root = E.path("proc")
+    os.makedirs(os.path.join(root, "self"), exist_ok=True)
+
+    def mk(pid, comm, state, ppid, wchan):
+        d = os.path.join(root, str(pid))
+        os.makedirs(os.path.join(d, "fd"), exist_ok=True)
+        f = [state, str(ppid), str(pid), str(pid), "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
+             "20", "0", "1", "0", "1000", "2000000", "40"]
+        with open(os.path.join(d, "stat"), "w") as fh:
+            fh.write(f"{pid} ({comm}) " + " ".join(f) + "\n")
+        for name in ("cmdline", "environ", "smaps_rollup", "status"):
+            p = os.path.join(d, name)
+            if state == "D":
+                os.mkfifo(p)              # reading it would hang, as on a real D process
+            else:
+                open(p, "w").close()
+        with open(os.path.join(d, "syscall"), "w") as fh:
+            fh.write("0 0x3 0x0\n")
+        with open(os.path.join(d, "wchan"), "w") as fh:
+            fh.write(wchan + "\n")
+
+    mk(900, "bash", "S", 1, "0")
+    mk(901, "python3", "D", 900, "0")
+    mk(903, "git", "D", 900, "p9_client_rpc")
+    events = E.path("state", "watch", "events.jsonl")
+
+    def scan(extra):
+        if os.path.exists(events):
+            os.unlink(events)
+        r = E.run("watch", "--once", env=dict({"DINGO_FAKE_PROC": root, "DINGO_SCOPE_TAG": ""}, **extra), timeout=30)
+        ev = []
+        try:
+            with open(events) as f:
+                ev = [json.loads(x) for x in f if x.strip()]
+        except OSError:
+            pass
+        st = {}
+        try:
+            with open(E.path("state", "watch", "status.json")) as f:
+                st = json.load(f)
+        except OSError:
+            pass
+        return r, [e for e in ev if e.get("kind") == "kernel-stuck"], st
+
+    r, ks, st = scan({})
+    check("watch stuck: a D just seen (0 s < 30 s default) is not alerted, but is in status.json",
+          r.returncode == 0 and not ks and st.get("blocked_total") == 2 and st.get("blocked_alarm") == 0
+          and st.get("stuck_secs") == 30, f"rc {r.returncode} {ks} {st.get('blocked_total')} {st.get('blocked_alarm')}")
+    check("watch stuck: a 9p wait (wchan p9_client_rpc) is counted as net, the other D is not",
+          st.get("blocked_net") == 1 and {b["pid"]: b.get("net") for b in st.get("blocked") or []} == {901: False, 903: True},
+          str(st.get("blocked")))
+    r, ks, st = scan({"DINGO_WATCH_STUCK_SECS": "0"})
+    check("watch stuck: past the threshold (DINGO_WATCH_STUCK_SECS=0) the D process is alerted, the 9p wait is not",
+          [e.get("pid") for e in ks] == [901] and st.get("blocked_alarm") == 1, str(ks)[:300])
+    r, ks, st = scan({"DINGO_WATCH_STUCK_SECS": "0", "DINGO_WATCH_STUCK_NET_SECS": "0"})
+    check("watch stuck: a network-disk wait past stuck_net_secs (default 600 s) is alerted too",
+          sorted(e.get("pid") for e in ks) == [901, 903] and st.get("blocked_alarm") == 2, str(ks)[:300])
+    import fcntl                          # `watch status` shows D rows only for a live watcher: be one
+    st.update(pid=os.getpid(), t=time.time(), interval=2)
+    with open(E.path("state", "watch", "status.json"), "w") as f:
+        json.dump(st, f)
+    lock = open(E.path("state", "watch", "lock"), "a+")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        w = E.run("watch", "status", env={"DINGO_FAKE_PROC": root, "DINGO_SCOPE_TAG": ""}, timeout=30)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    check("watch status: the 9p wait is shown as a count, not as a stuck pid",
+          "1 in D waiting on a network / 9p disk" in w.stdout and "stuck pid 903" not in w.stdout, w.stdout[:400])
+
+
+def t_hint_readonly(E):
+    """read-only commands that only *name* a test / train script are not heavy (the
+    words after a `<(...)` / `$(...)`, a here-document body, git show / diff, sha256sum ...); really
+    running one still is, also inside a substitution or a shell fed by a here-document."""
+    hint = os.environ.get("SELFTEST_HINT") or os.path.join(HERE, "hooks", "hint.py")
+    cases = [("git show fd44b95:selftest_dingo_pack.py | sha256sum", False),
+             ("diff <(git show fd44b95:selftest_dingo_pack.py) selftest_dingo_pack.py", False),
+             ("cmp <(git show HEAD:train.py) <(cat train.py) && echo same", False),
+             ("echo $(sha256sum run_all.sh) selftest_x.py", False),
+             ("git diff fd44b95 -- selftest_dingo_pack.py | head -50", False),
+             ("sha256sum selftest_dingo_pack.py bin/dingo-pack", False),
+             ("cat > notes.md <<'EOF'\nrun python3 selftest_dingo_pack.py first\n./run_all.sh\nEOF", False),
+             ("python3 - <<EOF\nprint(1)\nEOF\nwc -l selftest_x.py", False),
+             # real runs stay heavy
+             ("python3 selftest_dingo_pack.py", True),
+             ("git diff | python3 selftest_x.py", True),
+             ("echo $(python3 run_all.py) done", True),
+             ("diff <(python3 eval_policy.py) expected.txt", True),
+             ("bash <<'EOF'\ncd x\npython3 selftest_dingo_pack.py\nEOF", True),
+             ("cat <<EOF > a.txt\nx\nEOF\npytest -q", True),
+             # a here-document piped into a shell is that shell's script
+             ("cat <<EOF | bash\npython3 train.py\nEOF", True),
+             ("cat <<'EOF' | sh\npytest -q\nEOF", True),
+             ("cat <<'EOF' | tee run.log | sudo bash -s\npython3 run_all.py\nEOF", True),
+             ("cat <<'EOF' | bash do.sh\npython3 train.py\nEOF", False),   # do.sh reads it as data
+             ("cat <<'EOF' | wc -l\npython3 train.py\nEOF", False),
+             # heavy work behind xargs / find -exec / backticks is still heavy
+             ("ls *.py | xargs python3 selftest_dingo_pack.py", True),
+             ("ls | xargs -n 1 -P 4 python3 train.py", True),
+             ("find . -name 'x_*.py' -exec python3 run_all.py {} \\;", True),
+             ("find . -name t.py -execdir pytest -q {} +", True),
+             ("echo `python3 run_all.py` done", True),
+             ("echo $(echo `pytest -q`)", True),
+             ("ls | xargs wc -l", False),
+             ("ls | xargs -I{} sha256sum {} selftest_x.py", False),
+             ("find . -name '*.md' -exec cat {} \\;", False),
+             ("echo `sha256sum run_all.sh` selftest_x.py", False),
+             ("echo '`python3 run_all.py`'", False)]
+    bad = []
+    for cmd, want in cases:
+        r = subprocess.run([PY, hint], input=json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}}),
+                           capture_output=True, text=True, env=dict(E.env, DINGO_ENFORCE="1"), cwd=E.base)
+        o = json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else {}
+        got = o.get("permissionDecision") == "deny"
+        if got != want or r.returncode != 0:
+            bad.append(f"{cmd!r}: want {'deny' if want else 'pass'}, got {'deny' if got else 'pass'}")
+    check("hint hook: read-only commands naming test scripts pass, real runs are still refused",
+          not bad, "; ".join(bad))
+
+
+def t_guard_stale_text(E):
+    """a stale guard.json says the *guard* has stopped. Whether the watch is
+    down is a separate reading (its own lock and scan age); a dead guard next to a live watch must not
+    be reported as "the watch may be down" - that sends people to restart a healthy watch."""
+    import fcntl
+    wd = E.path("state", "watch")
+    os.makedirs(wd, exist_ok=True)
+
+    def put(name, obj):
+        with open(os.path.join(wd, name), "w") as f:
+            json.dump(obj, f)
+
+    put("guard.json", {"t": time.time() - 2400 * 60, "every": 120, "ok": True, "starts": 0, "pid": 999999})
+
+    def status(watch_t):
+        put("status.json", {"pid": os.getpid(), "t": watch_t, "interval": 2, "level": "ok"})
+        lock = open(os.path.join(wd, "lock"), "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            return E.run("watch", "status", timeout=30).stdout
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+
+    def gline(out):
+        return next((x for x in out.splitlines() if x.startswith("guard:")), "")
+
+    out = status(time.time())                     # watch alive and scanning, guard dead 40 h
+    g = gline(out)
+    check("guard STALE, watch alive: the guard line says the guard stopped and the watch itself is running",
+          "STALE" in g and "may be down" not in g and "watch itself" in g and "running" in g
+          and f"pid {os.getpid()}" in g, g)
+    check("guard STALE, watch alive: the line says how to bring back the guard, not the watch",
+          "watch guard" in g and "watch stop" not in g, g)
+    out = status(time.time() - 900)               # watch holds the lock but its last scan is 15 min old
+    g = gline(out)
+    check("guard STALE, watch stuck: both are named, the watch as stuck",
+          "STALE" in g and "watch itself" in g and "STUCK" in g, g)
+    put("status.json", {"pid": 4242, "t": time.time() - 3600, "interval": 2})
+    g = gline(E.run("watch", "status", timeout=30).stdout)      # nobody holds the lock: no watch
+    check("guard STALE, no watch: the line says the watch is not running either",
+          "STALE" in g and "watch itself" in g and "not running" in g, g)
+
+
+def t_stall_last_line(E):
+    """the session's *current* status line counts. Sessions often keep their
+    status line at the top of the log and edit it in place, while someone else adds or inserts a line
+    further down (someone else's closing note, a correction). The one with the later own time wins; position breaks
+    ties. A session that moved on to 等指挥 / 等 Yi / 已交 is never reported as stalled."""
+    probe = E.path("stall_probe.py")
+    with open(probe, "w") as f:
+        f.write("import importlib.util, json, os, sys, time\n"
+                "from importlib.machinery import SourceFileLoader\n"
+                "ld = SourceFileLoader('dp', sys.argv[1])\n"
+                "spec = importlib.util.spec_from_loader('dp', ld)\n"
+                "m = importlib.util.module_from_spec(spec); ld.exec_module(m)\n"
+                "base = sys.argv[2]; H = 3600; t = time.time()\n"
+                "st = lambda dt: time.strftime('%m-%d %H:%M', time.localtime(t + dt))\n"
+                "pc = {'log_glob': 'log/*_{name}.md', 'status_regex': '【状态'}\n"
+                "os.makedirs(os.path.join(base, 'log'), exist_ok=True)\n"
+                "pad = ''.join('- 第 %d 行 做了点事，读数照常，没有状态词\\n' % k for k in range(4000))\n"
+                "cases = {\n"
+                "  # top line edited in place to 等指挥 (newer); an older 跑着 inserted further down, big log\n"
+                "  'top-wait-big': ('# log\\n\\n【状态 柏林 %s】等指挥 · 交了第 3 段\\n\\n' % st(-600) + pad[:len(pad)//2]\n"
+                "                   + '【状态 柏林 %s】跑着 · 更正：已续起\\n' % st(-5 * H) + pad, '等指挥'),\n"
+                "  'top-handed-small': ('# log\\n\\n【状态 柏林 %s】已交 · 交了\\n\\n- x\\n【状态 柏林 %s】跑着 · 更正\\n- y\\n'\n"
+                "                       % (st(-300), st(-4 * H)), '已交'),\n"
+                "  'top-wait-yi': ('# log\\n【状态 柏林 %s】等 Yi · 要定 y\\n- x\\n【状态 柏林 %s】跑着 · 旧行\\n' % (st(-60), st(-6 * H)), '等 Yi'),\n"
+                "  # the usual layout: lines appended at the end, the last one is the newest\n"
+                "  'append': ('# log\\n【状态 柏林 %s】跑着 · a\\n- x\\n【状态 柏林 %s】等指挥 · b\\n' % (st(-5 * H), st(-60)), '等指挥'),\n"
+                "  # top line is old 跑着, someone appended a newer 已关 at the end: the end wins\n"
+                "  'top-old-end-closed': ('# log\\n【状态 柏林 %s】跑着 · a\\n' % st(-5 * H) + pad\n"
+                "                         + '【状态 柏林 %s】已关 · 关窗\\n' % st(-60), '已关'),\n"
+                "  # appended layout whose first line sits inside section 1, not above it, and whose last time was\n"
+                "  # written ahead of the clock (not read from `date`): position wins, the times do not\n"
+                "  'end-ahead': ('# log\\n\\n## 1 · 开工\\n- a\\n【状态 柏林 %s】跑着 · 读数\\n- x\\n【状态 柏林 %s】已交 · 交审\\n'\n"
+                "                % (time.strftime('%H:%M', time.localtime(t - 3 * H)), time.strftime('%H:%M', time.localtime(t + 40 * 60))), '已交'),\n"
+                "  # a really stalled session: top line 跑着, nothing newer anywhere\n"
+                "  'top-running': ('# log\\n【状态 柏林 %s】跑着 · 训练中\\n' % st(-5 * H) + pad, '跑着'),\n"
+                "}\n"
+                "words, sess = {}, {}\n"
+                "for name, (text, _) in cases.items():\n"
+                "    with open(os.path.join(base, 'log', '2000-01-02_%s.md' % name), 'w') as f:\n"
+                "        f.write(text)\n"
+                "    lp, line = m.status_line(base, name, pc)\n"
+                "    words[name] = m.status_word(line)\n"
+                "    sess[name] = {'alive': True, 'name': name, 'status_line': line, 'status_changed_at': t - 5 * H}\n"
+                "wc = {'stall_words': ['跑着'], 'stall_h': 2}\n"
+                "stalled = sorted(x['name'] for x in m.stalled_sessions({'sessions': sess}, wc, t))\n"
+                "print('RESULT', json.dumps({'words': words, 'want': {k: v[1] for k, v in cases.items()}, 'stalled': stalled},\n"
+                "                           ensure_ascii=False))\n")
+    r = subprocess.run([PY, probe, E.tool, E.path("proj")], env=E.env, capture_output=True, text=True, timeout=60)
+    try:
+        res = json.loads(r.stdout.split("RESULT", 1)[1])
+    except (IndexError, ValueError):
+        res = {"words": {}, "want": {"?": "?"}, "stalled": None}
+    bad = {k: (res["words"].get(k), v) for k, v in res["want"].items() if res["words"].get(k) != v}
+    check("status line: the current line is the newer of the top line and the last one (top edited in "
+          "place, older lines inserted below; big and small logs; the usual appended layout unchanged)",
+          r.returncode == 0 and not bad, (bad, r.stderr[-300:]))
+    check("stalled: only the session whose current line is still 跑着; 等指挥 / 已交 / 等 Yi / 已关 are not",
+          res["stalled"] == ["top-running"], res["stalled"])
+
+
+
+# ------------------------------------------------------------ watch crashes leave evidence
+
+def _read_jsonl(path):
+    out = []
+    try:
+        with open(path) as f:
+            for x in f:
+                try:
+                    out.append(json.loads(x))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _wait_for(fn, timeout=20.0, step=0.1):
+    end = time.time() + timeout
+    while time.time() < end:
+        v = fn()
+        if v:
+            return v
+        time.sleep(step)
+    return fn()
+
+
+def _watch_pid(E, not_pid=None):
+    """pid of the watch that wrote status.json, once it is a live one other than not_pid."""
+    def get():
+        pid = _read_json(E.path("state", "watch", "status.json")).get("pid")
+        if pid and pid != not_pid:
+            try:
+                os.kill(int(pid), 0)
+                return int(pid)
+            except OSError:
+                return None
+        return None
+    return _wait_for(get)
+
+
+def t_watch_faulthandler(E):
+    """once the watch died 119 times by SIGSEGV and left nothing but the
+    exit code. `watch run` enables faulthandler into <watch dir>/fault.log, so a crash leaves a Python stack."""
+    p = E.popen("watch", "--interval", "0.2", "--scans", "500")
+    try:
+        pid = _watch_pid(E)
+        time.sleep(0.5)
+        if pid:
+            os.kill(pid, signal.SIGSEGV)
+        rc = p.wait(timeout=30)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    text = ""
+    try:
+        with open(E.path("state", "watch", "fault.log"), errors="replace") as f:
+            text = f.read()
+    except OSError:
+        pass
+    check("watch faulthandler: a SIGSEGV leaves a header with the pid and a Python stack in fault.log",
+          rc == -signal.SIGSEGV and f"pid {pid}" in text and "Segmentation fault" in text
+          and "dingo-pack" in text, (rc, pid, text[-400:]))
+
+
+def t_watch_respawn(E):
+    """--respawn restarts a crashed watch, names the signal (139 = SIGSEGV),
+    and stops after crash_max crashes in crash_window with a crash-loop event; the guard then does
+    not start it again; a clean `watch stop` ends both watch and supervisor."""
+    with open(E.path("config.json"), "w") as f:
+        json.dump({"watch": {"crash_max": 3, "crash_window": 120, "respawn_delay": 0.2}}, f)
+    events = E.path("state", "watch", "events.jsonl")
+    sup = E.popen("watch", "--respawn", "--interval", "0.2")
+    pids = []
+    try:
+        last = None
+        for i in range(3):
+            pid = _watch_pid(E, not_pid=last)
+            if not pid:
+                break
+            pids.append(pid)
+            time.sleep(0.3)
+            os.kill(pid, signal.SIGSEGV)
+            last = pid
+        rc = sup.wait(timeout=30)
+    finally:
+        if sup.poll() is None:
+            sup.kill()
+            sup.wait()
+    ev = _read_jsonl(events)
+    crashes = [e for e in ev if e.get("kind") == "watch-crash"]
+    loops = [e for e in ev if e.get("kind") == "crash-loop"]
+    check("watch respawn: each crash restarts the watch with a new pid", len(set(pids)) == 3, pids)
+    check("watch respawn: each crash is recorded with its signal - 139 is written as SIGSEGV",
+          len(crashes) == 3 and all(e.get("rc") == -11 and "SIGSEGV" in e.get("msg", "") and "139" in e.get("msg", "")
+                                    for e in crashes), crashes[:1])
+    rs = _read_json(E.path("state", "watch", "respawn.json"))
+    check("watch respawn: 3 crashes (crash_max) -> one crash-loop event, the supervisor stops (rc 1), no 4th watch",
+          len(loops) == 1 and rc == 1 and rs.get("state") == "crash-loop"
+          and E.run("watch", "status", "--json", timeout=30).stdout.count('"running": false') == 1,
+          (rc, loops, rs.get("state")))
+    g = E.run("watch", "guard", "--once", "--every", "5", timeout=60)
+    gj = _read_json(E.path("state", "watch", "guard.json"))
+    st = E.run("watch", "status", timeout=30).stdout
+    check("watch respawn: the guard does not restart a watch in a crash loop and says why",
+          g.returncode == 1 and gj.get("starts", 0) == 0 and "crash loop" in (gj.get("detail") or "")
+          and "crash loop" in st and "not running" in st, (g.returncode, gj, st[:300]))
+    st = E.run("watch", "status", env={"DINGO_FAKE_BTIME": str(time.time() + 5)}, timeout=30).stdout
+    check("watch respawn: a crash-loop mark from before the last boot no longer counts",
+          "watch: not running - start it" in st and "watch: not running - it died" not in st, st[:300])
+    # started by hand: the crash-loop mark is cleared; a clean stop ends the supervisor too
+    E.run("watch", "--daemon", timeout=60)
+    wpid = _watch_pid(E, not_pid=pids[-1] if pids else None)
+    rs = _wait_for(lambda: (lambda d: d if d.get("state") == "running" else None)(
+        _read_json(E.path("state", "watch", "respawn.json"))))
+    spid = (rs or {}).get("pid")
+    E.run("watch", "stop", timeout=30)
+
+    def gone(p):
+        try:
+            os.kill(int(p), 0)
+            with open(f"/proc/{int(p)}/stat") as f:
+                return f.read().split(") ")[1].split()[0] == "Z"
+        except (OSError, TypeError, ValueError):
+            return True
+    both = _wait_for(lambda: gone(wpid) and gone(spid), timeout=15)
+    ev = _read_jsonl(events)
+    check("watch respawn: --daemon runs under the supervisor; `watch stop` ends both, no restart, no new crash",
+          wpid and spid and both and len([e for e in ev if e.get("kind") == "watch-crash"]) == 3
+          and _read_json(E.path("state", "watch", "respawn.json")).get("state") == "stopped",
+          (wpid, spid, both, _read_json(E.path("state", "watch", "respawn.json"))))
+
+
+ODD_PROBE = r"""
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+ld = SourceFileLoader('dp', sys.argv[1]); spec = importlib.util.spec_from_loader('dp', ld)
+m = importlib.util.module_from_spec(spec); ld.exec_module(m)
+kind = sys.argv[2]
+def bad(self):
+    raise {"type": TypeError("'<' not supported between instances of 'str' and 'int'"),
+           "runtime": RuntimeError("plain bug")}[kind]
+if kind == "stall":
+    m.Watcher.stall_scan = lambda self, force=False: (_ for _ in ()).throw(KeyError("side feature bug"))
+else:
+    m.Watcher.step = bad
+sys.exit(m.main(["watch", "--interval", "0.05", "--scans", "5"]))
+"""
+
+
+def t_watch_odd_errors(E):
+    """TypeError / KeyError / SystemError twice within a minute in one watch
+    means the interpreter may be corrupt (in one crash all 7 came in the minute before a SIGSEGV). Exit
+    and let the supervisor restart it, instead of taking kill decisions in that interpreter."""
+    probe = E.path("odd_probe.py")
+    with open(probe, "w") as f:
+        f.write(ODD_PROBE)
+    r = subprocess.run([PY, probe, E.tool, "type"], env=E.env, capture_output=True, text=True, timeout=60)
+    ev = [e for e in _read_jsonl(E.path("state", "watch", "events.jsonl")) if e.get("kind") == "odd-errors"]
+    check("watch odd errors: 2 TypeErrors in a minute -> exit 70 with an odd-errors event, not 5 more scans",
+          r.returncode == 70 and r.stderr.count("scan failed") == 2 and len(ev) == 1, (r.returncode, r.stderr[-300:], ev))
+    r = subprocess.run([PY, probe, E.tool, "runtime"], env=E.env, capture_output=True, text=True, timeout=60)
+    check("watch odd errors: other exceptions are only logged; the watch keeps scanning",
+          r.returncode == 0 and r.stderr.count("scan failed") == 5, (r.returncode, r.stderr[-300:]))
+    r = subprocess.run([PY, probe, E.tool, "stall"], env=E.env, capture_output=True, text=True, timeout=60)
+    check("watch odd errors: a KeyError in the status-line check every scan is logged, not counted; memory scans go on",
+          r.returncode == 0 and r.stderr.count("status-line check failed") == 5 and "scan failed" not in r.stderr,
+          (r.returncode, r.stderr[-300:]))
+
+
+def t_stuck_heavy(E):
+    """with many processes in D (once up to 5 071; normal days at most 36)
+    the scan reads only `stat`: no syscall / wchan / fds per D process, and the ancestor walk is
+    capped per scan - the rest wait for the next scan."""
+    root = E.path("proc")
+    os.makedirs(os.path.join(root, "self"), exist_ok=True)
+
+    def mk(pid, comm, state, ppid):
+        d = os.path.join(root, str(pid))
+        os.makedirs(os.path.join(d, "fd"), exist_ok=True)
+        f = [state, str(ppid), str(pid), str(pid), "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
+             "20", "0", "1", "0", "1000", "2000000", "40"]
+        with open(os.path.join(d, "stat"), "w") as fh:
+            fh.write(f"{pid} ({comm}) " + " ".join(f) + "\n")
+        for name in ("cmdline", "environ", "smaps_rollup", "status"):
+            open(os.path.join(d, name), "w").close()
+        with open(os.path.join(d, "syscall"), "w") as fh:
+            fh.write("7 0x3 0x0\n")
+        with open(os.path.join(d, "wchan"), "w") as fh:
+            fh.write("rwsem_down_write_slowpath\n")
+        open(os.path.join(d, "fd", "3"), "w").close()
+
+    mk(900, "bash", "S", 1)
+    for i in range(30):
+        mk(1000 + i, "ps", "D", 900)
+    env = {"DINGO_FAKE_PROC": root, "DINGO_SCOPE_TAG": ""}
+    stf = E.path("state", "watch", "status.json")
+    E.run("watch", "--once", env=env, timeout=60)
+    st = _read_json(stf)
+    rows = st.get("blocked") or []
+    check("watch stuck heavy: 30 D under the default threshold - details read as before",
+          not st.get("stuck_heavy") and rows and all(b.get("syscall") == "7 0x3 0x0" for b in rows), str(rows[:1]))
+    heavy = dict(env, DINGO_WATCH_STUCK_HEAVY="10", DINGO_WATCH_STUCK_SCAN_MAX="8")
+    E.run("watch", "--once", env=heavy, timeout=60)
+    st = _read_json(stf)
+    rows = st.get("blocked") or []
+    check("watch stuck heavy: over the threshold - stat only, no syscall / wchan / fds read",
+          st.get("stuck_heavy") is True and st.get("blocked_total") == 30 and rows
+          and all(not b.get("syscall") and not b.get("wchan") and not b.get("fds") for b in rows), str(rows[:1]))
+    check("watch stuck heavy: ancestor walk capped at 8 per scan, 22 left for the next scans",
+          st.get("stuck_pending") == 22, st.get("stuck_pending"))
+    E.run("watch", "--scans", "4", "--interval", "0.05", env=heavy, timeout=60)
+    st = _read_json(stf)
+    check("watch stuck heavy: the rest are walked in later scans (4 scans x 8 >= 30 -> none pending)",
+          st.get("stuck_pending") == 0 and st.get("blocked_total") == 30, st.get("stuck_pending"))
+
+
+def t_guard_exit_note(E):
+    """the guard died silently (STALE for 9 days, nobody knew why).
+    A guard that exits writes one log line with the reason or signal, and guard.json says so."""
+    p = E.popen("watch", "guard", "--every", "30")
+    try:
+        _wait_for(lambda: os.path.exists(E.path("state", "watch", "guard.json")), timeout=30)
+        time.sleep(0.5)
+        p.send_signal(signal.SIGTERM)
+        rc = p.wait(timeout=30)
+    finally:
+        if p.poll() is None:
+            p.kill()
+        E.run("watch", "stop", timeout=30)
+    ex = [x for x in E.log() if x.get("op") == "watch-guard-exit"]
+    gj = _read_json(E.path("state", "watch", "guard.json"))
+    check("guard exit: SIGTERM -> one watch-guard-exit log line naming the signal, and guard.json records it",
+          len(ex) == 1 and ex[0].get("signal") == "SIGTERM" and "SIGTERM" in (gj.get("exited") or ""),
+          (rc, ex, gj))
+
+TESTS = [t_names_cards, t_queue, t_claims, t_claim_freeform, t_claim_release, t_claim_review, t_boxes, t_probe_readonly, t_tasks, t_adapters, t_board, t_cpu, t_backfill, t_peak_commit, t_turnover, t_ghost_format, t_io_lane, t_who_json, t_overview_top, t_doctor, t_ghosts, t_stow, t_stow_race, t_shared_pages, t_grandchild, t_fallback_roster, t_hint, t_slots, t_fifo, t_kill_releases, t_exitcodes, t_fits, t_memory_pack, t_memory_liar, t_tree_limit, t_kernel_stuck, t_cleanup_race, t_read_cache, t_selflock_gate, t_watch_guard,
+         t_lease, t_roster, t_hook, t_local_state,
+         t_stuck_threshold, t_hint_readonly]
+TESTS += [t_guard_stale_text, t_stall_last_line]
+TESTS += [t_watch_faulthandler, t_watch_respawn, t_watch_odd_errors, t_stuck_heavy, t_guard_exit_note]
 
 
 def run_all(base, tool, only=None):

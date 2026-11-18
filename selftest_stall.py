@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""开-013 R1 (决赛指挥 11-04 20:01): a session whose status line says 跑着 and has not changed for
+"""a session whose status line says 跑着 and has not changed for
 stall_h hours (default 2) is reported by watch (event + status), `who` and `board`; 已交 / 已关 /
 等 Yi / a session that has ended are not.
 
@@ -34,12 +34,12 @@ def stamp(dt):
 home = os.path.join(BASE, "dh")
 ch = os.path.join(BASE, "claude")
 cwd = os.path.join(BASE, "proj")
-# logs kept the HQ way: outside the session's cwd, one directory per team (the directory part is a pattern)
-teams = [os.path.join(BASE, "hqf", "指挥台", t, "日志") for t in ("决赛", "研究线_开源")]
+# logs kept outside the session's cwd, one directory per team (the directory part is a pattern)
+teams = [os.path.join(BASE, "notes", t, "logs") for t in ("team-a", "team-b")]
 for d in [home, os.path.join(ch, "sessions"), os.path.join(ch, "projects", "-proj"), cwd] + teams:
     os.makedirs(d, exist_ok=True)
 cfg = os.path.join(BASE, "config.json")
-json.dump({"projects": {os.path.realpath(cwd): {"log_glob": "../hqf/指挥台/*/日志/*_{name}.md", "status_regex": "【状态"}}},
+json.dump({"projects": {os.path.realpath(cwd): {"log_glob": "../notes/*/logs/*_{name}.md", "status_regex": "【状态"}}},
           open(cfg, "w"))
 logpath = {}
 H = 3600
@@ -61,7 +61,7 @@ for k, (name, (line, alive, _)) in enumerate(lines.items()):
               open(os.path.join(ch, "sessions", f"{p.pid}.json"), "w"))
     with open(os.path.join(ch, "projects", "-proj", f"{sid}.jsonl"), "w") as f:
         f.write(json.dumps({"type": "user", "message": {"content": name}}) + "\n")
-    logpath[name] = os.path.join(teams[k % 2], f"2026-11-04_{name}.md")
+    logpath[name] = os.path.join(teams[k % 2], f"2000-01-02_{name}.md")
     with open(logpath[name], "w") as f:
         f.write(f"# log\n- 做了点事\n\n{line}\n")
 for p, (line, alive, _) in zip(procs, lines.values()):

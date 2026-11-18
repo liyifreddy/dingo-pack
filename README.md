@@ -46,6 +46,8 @@ pipx install git+https://github.com/liyifreddy/dingo-pack
 dingo-pack                                    # one screen: memory, slots, sessions
 dingo-pack run --heavy --mem 4G -- pytest     # heavy work waits for a slot and free memory
 dingo-pack doctor                             # what's wrong with this machine right now?
+dingo-pack stuck                              # who is stuck in the kernel, and what piles up behind it
+dingo-pack watch guard --once --every 60      # cron, every minute: restart the watch if it is gone or its scan is stale
 dingo-pack list                               # after a crash: which sessions were lost
 dingo-pack resume --midway                    # reopen the ones that were mid-task
 ```
@@ -61,7 +63,7 @@ One file, Python ≥ 3.8, standard library only. Linux, macOS and WSL.
 
 ## Release and installation demo
 
-Current release: **0.4.2**. Install it from PyPI with pip or pipx:
+Current release: **0.5.3**. Install it from PyPI with pip or pipx:
 
 ```sh
 python3 -m pip install dingo-pack        # or: pipx install dingo-pack
@@ -76,7 +78,7 @@ python3 -m venv .venv-demo && .venv-demo/bin/python -m pip install .
 .venv-demo/bin/dingo-pack run --heavy --threads 1 --mem 64M -- python3 -c 'print("hello")'
 ```
 
-Expected from either: `dingo-pack 0.4.2`; the source demo also prints `hello`
+Expected from either: `dingo-pack 0.5.3`; the source demo also prints `hello`
 (admission may wait). State and locks must live on a local disk; leave `DINGO_HOME`
 at its default, outside a WSL mounted drive. `boxes`, `tokens`, adapter validation
 and task/wait columns are included; `dispatch` and the full three-table crosscheck
@@ -85,7 +87,7 @@ are not here (dispatch is shepherd-dispatch's job). See [CHANGELOG](CHANGELOG.md
 
 ## Platforms and agents
 
-| Platform | Support boundary | Tested for this candidate (2026-11-04) |
+| Platform | Support boundary | Tested for this candidate |
 |---|---|---|
 | Linux | POSIX CLI and `/proc` monitoring | WSL Linux kernel tested; separate native Linux host not tested |
 | WSL2 | Run Python and the CLI inside WSL; state on the Linux disk | Tested: full suite, bounded CSV and install smoke |
@@ -130,8 +132,11 @@ a configured cap mean **possible memory limit hit**, not proof of OOM. A tree-li
 stop is confirmed by the supervisor. An ordinary nonzero exit keeps its cause unknown;
 read the child's `MemoryError`, parser error or application error too.
 
-Without configuration, defaults are `--mem 1G`, per-process `--limit 1.5G`, and matching tree limit.
-`default_mem` / `DINGO_DEFAULT_MEM` overrides the estimate. RLIMIT_DATA
+Without configuration, defaults are `--mem 1G` and a tree limit of 1.5 × `--mem`; the
+per-process `--limit` is opt-in (`0` = none). RLIMIT_DATA / RLIMIT_AS count address space,
+not RSS - `import numpy` alone maps ~1.1 GB while RSS stays near 27 MB - so a 1.5 × `--mem`
+default used to kill correct jobs that had only used a few percent of what they declared.
+The tree limit measures real memory (PSS/RSS) and is the default guard. RLIMIT_DATA
 and RLIMIT_AS are not RSS: failed allocations and brief peaks can be missed by RSS
 sampling. For large CSVs, prefer chunked reading; if more memory is needed, check
 available memory and raise the estimate/caps together. Input file size alone does not
@@ -190,9 +195,11 @@ dingo-pack top                                            # memory by session
 - `--threads N` (default 8) sets `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`
   and friends for the job and takes N of the machine's CPU slots (one per core). `doctor`
   and the hint warn when the load is above 1.5 per core.
-- `--mem` is your best guess at the peak. The limit defaults to 1.5 × that; go over it
-  and only your job stops (a single process gets a MemoryError; a whole tree over the
-  limit is stopped with exit 137), not the machine.
+- `--mem` is your best guess at the peak. The tree limit (measured by PSS/RSS) defaults to
+  1.5 × that; go over it and only your job is stopped with exit 137, not the machine.
+  `--limit` adds a cap on one process's *address space* (RLIMIT_DATA/AS) and is off by
+  default: importing numpy alone maps ~1.1 GB while RSS stays near 27 MB, so a virtual-size
+  cap fires far below real use and shows up as MemoryError inside the child.
 - Work that isn't a shell command — an agent's own review, a batch of sub-agents — takes
   a lease: `dingo-pack lease --mem 3G --for 45m`, then `dingo-pack release`. The lease
   also ends when its agent exits.
@@ -227,6 +234,33 @@ dingo-pack watch resume 12345      # continue a paused job (or: all)
 dingo-pack session --name X --max 8G -- claude ...   # an agent session with a name and a cap
 ```
 
+The guard has no supervisor above it. Run it from cron or a systemd timer every minute, so a dead watchdog is started again:
+`* * * * * ~/.local/bin/dingo-pack watch guard --once --every 60`. `--every` must match the real period: the guard is
+shown STALE once its last check is older than max(3 x every, 5 min), and a period equal to that line (e.g. every
+5 minutes with the default 60) would show STALE at every tick.
+
+When it crashes, it says so and restarts by itself, up to a point:
+
+- `watch --daemon` runs the watch under a small supervisor (`watch --respawn`). When the watch
+  dies, the supervisor logs a `watch-crash` event with the exit code and the signal (`-11` / `139`
+  is written as SIGSEGV) and starts it again after 2 s. After 5 deaths within 10 min
+  (`crash_max`, `crash_window`) it writes a `crash-loop` event and stops. The guard does not
+  restart a watch in a crash loop either: `who` / `watch status` say so. Look at the stack, then
+  start it by hand with `dingo-pack watch --daemon`. The guard handles a watch that hangs without
+  dying, and a missing supervisor; `watch stop` stops both.
+- Every watch (and guard) writes Python's fault handler to `watch/fault.log`, with one header line
+  per start (time, role, pid). A segfault leaves the Python stack of every thread there. Over 1 MB,
+  the file moves to `fault.log.1`.
+- A TypeError, KeyError or SystemError cannot come out of the scan code when the interpreter is
+  sane. Two of them within a minute (`odd_max`, `odd_window`) make the watch log `odd-errors` and
+  exit with code 70, so the supervisor starts a fresh one. A watch whose interpreter may be
+  corrupt makes no more pause or kill decisions.
+- With more than 200 processes in state D (`stuck_heavy`), a scan reads only their `stat`, not
+  syscall, wchan or fds. It walks the ancestors of at most 200 new ones per scan
+  (`stuck_scan_max`) and leaves the rest for later scans (`stuck_pending` in `status.json`).
+- A guard that stops on SIGTERM, SIGINT, SIGHUP or an error writes a `watch-guard-exit` log line
+  with the reason, and `guard.json` keeps it (`exited`). SIGKILL cannot be caught.
+
 - Every 2 s it looks at all of this user's processes, **also those not started through
   dingo-pack**, and groups them by session (`DINGO_SESSION` / `CLAUDE_PID` in the environment,
   else the nearest agent ancestor: claude, codex, opencode, hermes).
@@ -248,6 +282,8 @@ dingo-pack session --name X --max 8G -- claude ...   # an agent session with a n
 - Every 5 min it also reads each live session's status line (as `board` does): one that says
   跑着 and has not changed for 2 h (`"watch": {"stall_h": 2}`) becomes an event and a `stalled:`
   line in `who` / `board` with the session, how long and the log. 已交 / 已关 / 等 Yi are left alone.
+- A process in kernel state D is reported only after `"watch": {"stuck_secs": 30}` seconds; D on a
+  network / 9p disk (wchan prefixes in `"stuck_net_wchan"`) is counted, and alerted only after `"stuck_net_secs"` (600).
 - `dingo-pack who --gate --need 4G` exits 1 when there is no room for a new session or a job is
   still paused (for launch scripts). `watch resume` also works while no watch runs, and the
   gate then lets the next one in.

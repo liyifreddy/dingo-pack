@@ -110,10 +110,11 @@ dingo-pack who                                           # who holds slots, who 
 dingo-pack log -n 20                                     # one JSON line per job
 ```
 
-- `--mem` is the expected peak (default 1G; configurable via default_mem / DINGO_DEFAULT_MEM). `--limit` is the per-process limit
-  (default 1.5 × `--mem`; `0` = none). `--tree-limit` caps the sum over the job's whole
-  process tree (default = `--limit`): a program that forks 8 workers, each under the
-  per-process limit, is still caught. Over the tree limit the tree gets SIGTERM, then
+- `--mem` is the expected peak (default 1G; configurable via default_mem / DINGO_DEFAULT_MEM). `--limit` is the opt-in per-process
+  limit on virtual size (default none, `0`; RLIMIT_DATA / AS count address space, not RSS -
+  `import numpy` maps ~1.1 GB at ~27 MB RSS). `--tree-limit` caps the sum over the job's whole
+  process tree (default 1.5 × `--mem`, or `--limit` when that is given): a program that forks
+  8 workers, each under the per-process limit, is still caught. Over the tree limit the tree gets SIGTERM, then
   SIGKILL after 10 s, and `run` exits 137 with a line saying so.
 - Reserve: `max(1 GB, 10 % of RAM)` by default (`DINGO_RESERVE`). Slot count: not fixed —
   the ceiling is the number of CPU slots, and memory admission + CPU slots decide; `who` /
@@ -191,7 +192,7 @@ keyed by the project's absolute path:
   `name_regex` in its first message; else Claude Code's automatic name.
 - Status line: the last line matching `status_regex` in the newest file matching
   `log_glob` (`{name}` = session name; relative to the session's cwd; the directory part may be a
-  pattern too, for logs kept per team outside the repo: `../hq-files/指挥台/*/日志/*_{name}.md`).
+  pattern too, for logs kept per team outside the repo: `../team-notes/*/logs/*_{name}.md`).
 
 ## WSL notes
 
@@ -219,8 +220,10 @@ free -g; cat /proc/sys/vm/min_free_kbytes
 | Command | What it does |
 |---|---|
 | `watch [--interval S] [--dry-run] [--once] [--scans N]` | foreground guard loop (single instance via `watch/lock`) |
-| `watch --daemon` / `watch stop` | start in the background (log `watch/watch.out`) / stop it; paused jobs stay paused |
-| `watch status [--json]` | level, memory per session, paused jobs, last events |
+| `watch --daemon` / `watch stop` | start in the background under `--respawn` (log `watch/watch.out`) / stop the watch and its supervisor; paused jobs stay paused |
+| `watch --respawn` | supervisor: run the watch as a child, log each death as a `watch-crash` event (exit code and signal, e.g. `died of SIGSEGV (exit 139)`), start it again after `respawn_delay`; `crash_max` deaths within `crash_window` → `crash-loop` event, `watch/respawn.json` `state: crash-loop`, exit 1. Only `watch --daemon` (a new supervisor) clears the mark; a foreground `watch` does not. A mark written before the last boot no longer counts |
+| `watch status [--json]` | level, memory per session, paused jobs, self-locked sessions, last events |
+| `watch guard [--every S] [--once]` | outside heartbeat: start `watch --daemon` again when nobody holds the lock or the last scan is older than max(3 x interval, 2 min) (stopping the stale watch's supervisor first); records `watch/guard.json` and a log line; `--once` for cron. Does not restart a watch in a crash loop (`ok: false`, exit 1 with `--once`). On SIGTERM / SIGINT / SIGHUP or an error it logs `op: watch-guard-exit` with `why` / `signal` and writes `exited` into `guard.json` |
 | `watch resume [PID...\|all]` | SIGCONT a paused job's tree (each process re-checked, see below); works with or without a running watch |
 | `session [--name N] [--max SIZE] [--cgroup auto\|off] [--dry-run] -- CMD` | exec CMD with `DINGO_SESSION` / `DINGO_SESSION_MAX` set (systemd-run MemoryMax where cgroup v2 memory is delegated) |
 | `who --gate [--need SIZE]` | exit 1 if room after promised + reserve < need (default 4G), all slots are held, or a job is really still paused by watch (same process, state T) |
@@ -237,6 +240,15 @@ process; a manual `watch resume` neither counts nor resets it), `protect` (extra
 never touched). Events: `watch/events.jsonl` and `log.jsonl` (`op: watch`); status:
 `watch/status.json`.
 
+Crashes: `watch` and `watch guard` enable faulthandler into `watch/fault.log` (one header line per
+start: time, role, pid; moved to `fault.log.1` over 1 MB). Supervisor keys: `crash_max` 5,
+`crash_window` 600 s, `respawn_delay` 2 s. `odd_max` 2 TypeError / KeyError / SystemError within
+`odd_window` 60 s in one watch → `odd-errors` event, exit 70 (`EX_SOFTWARE`), and the supervisor
+starts a fresh one. Many in D: above `stuck_heavy` 200 processes in state D, a scan reads only
+their `stat` (no syscall / wchan / fds, `kill_pending` unknown) and walks the ancestors of at
+most `stuck_scan_max` 200 new ones; `status.json` has `stuck_heavy` and `stuck_pending`. All
+keys also as `DINGO_WATCH_<KEY>`.
+
 Stalled status lines: every `stall_every` (300 s; 0 = off, off by default under `DINGO_SCOPE_TAG`)
 watch refreshes the roster the way `board` does (status lines from each session's log, per
 project `log_glob` / `status_regex`; bounded to 30 s, so a hung mount cannot stop the guard). A
@@ -247,6 +259,13 @@ a `stalled` list in `status.json`, a `stalled:` line in `who` (while watch runs)
 (computed there, also without watch) and a `stalled N h` flag on the board row. 已交 / 已关 /
 等 Yi / 等指挥 / 卡住 and ended sessions are not reported. `DINGO_WATCH_STALL_H`,
 `DINGO_WATCH_STALL_EVERY`.
+
+Kernel-stuck (processes in state D): a process is reported only after it has stayed in D for
+`stuck_secs` (default 30; `DINGO_WATCH_STUCK_SECS`). A D whose wchan starts with one of
+`stuck_net_wchan` (default `p9_`, `v9fs_`, `nfs`, `rpc_wait`, `cifs`, `smb2`, `wait_for_response`,
+`fuse_`, `request_wait_answer`) is a slow network / 9p disk: it is counted in `status.json`
+(`blocked_net`) and in `watch status`, and alerted only after `stuck_net_secs` (default 600;
+`DINGO_WATCH_STUCK_NET_SECS`): a share that has not answered for ten minutes is hung.
 
 Signal safety: a pause record keeps pid, start time and owner of every process in the tree
 (`members`). Before each SIGSTOP / SIGCONT / SIGKILL every member is checked again (same start

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""开-006 bad-input checks for `dingo-pack watch` / `session` / `run` caps.
+"""bad-input checks for `dingo-pack watch` / `session` / `run` caps.
 
 Memory pressure for watch is simulated (fake /proc/meminfo = budget - RSS of the test's own
 processes); the test processes really allocate (<= ~1.3 GB). Only processes carrying this test's
@@ -119,7 +119,8 @@ def test_grow_pause_resume():
     wait_for(lambda: rss_tree(agent.pid) > 450 * MB, 10)
     # an unowned big process (no session): alert only, never paused by default
     lone_code = "import time;b=bytearray(300*1024*1024);time.sleep(120)"
-    lone_env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PID",)}
+    lone_env = {k: v for k, v in os.environ.items()
+                if k not in ("CLAUDE_PID", "DINGO_SESSION", "DINGO_SESSION_MAX")}   # really unowned
     lone_env["DINGO_SCOPE_TAG"] = TAG
     out = subprocess.run(["bash", "-c", f"{sys.executable} -c '{lone_code}' >/dev/null 2>&1 & echo $!"], env=lone_env,
                          capture_output=True, text=True).stdout       # orphaned: no agent among its ancestors
@@ -251,10 +252,19 @@ def test_run_caps():
             time.sleep(0.05)
     a0 = int([l for l in open("/proc/meminfo") if l.startswith("MemAvailable")][0].split()[1]) * 1024
     t = threading.Thread(target=mon, daemon=True); t.start()
+    # Default: no per-process cap; the 1.5 x --mem tree limit (RSS) is what stops it.
     r = subprocess.run([sys.executable, TOOL, "run", "--heavy", "--mem", "300M", "--threads", "1", "--", sys.executable, "-c", EAT_CODE],
                        env=env, capture_output=True, text=True)
-    check("E1 one process past its cap (300M est, 450M limit, asks 3 GB) -> only it fails",
-          r.returncode != 0 and "ate" not in r.stdout and "MemoryError" in r.stderr, (r.returncode, r.stdout, r.stderr[-300:]))
+    check("E1 default: 300M est, no --limit -> the tree limit (450M RSS) stops it, exit 137",
+          r.returncode == 137 and "ate" not in r.stdout and "tree-limit" in r.stderr,
+          (r.returncode, r.stdout, r.stderr[-300:]))
+    # Explicit --limit is still a per-process cap on address space -> MemoryError in the child.
+    r = subprocess.run([sys.executable, TOOL, "run", "--heavy", "--mem", "300M", "--limit", "450M", "--tree-limit", "0",
+                        "--threads", "1", "--", sys.executable, "-c", EAT_CODE],
+                       env=env, capture_output=True, text=True)
+    check("E1b explicit --limit 450M -> the child itself fails (MemoryError), not the tree limit",
+          r.returncode != 0 and r.returncode != 137 and "ate" not in r.stdout and "MemoryError" in r.stderr,
+          (r.returncode, r.stdout, r.stderr[-300:]))
     code = ("import os,time\nfor i in range(4):\n if os.fork()==0:\n  b=bytearray(250*1024*1024);[b.__setitem__(j,1) for j in range(0,len(b),4096)];time.sleep(30);os._exit(0)\n"
             "time.sleep(30)")
     r = subprocess.run([sys.executable, TOOL, "run", "--heavy", "--mem", "300M", "--threads", "1", "--", sys.executable, "-c", code],
@@ -266,27 +276,63 @@ def test_run_caps():
           a0 - lo["v"] < 1.2 * GB, f"start {a0 / GB:.1f} G, lowest {lo['v'] / GB:.1f} G")
 
 
-def cleanup():
-    """Kill every process still carrying this test's tag (SIGKILL works on paused ones too)."""
+def cleanup(budget_s=10.0):
+    """Kill every process still carrying this test's tag (SIGKILL works on paused ones too).
+
+    Reads `stat` first and never opens a memory-walking file of a process in state D: once an
+    unbounded environ read here would have entered D behind a stuck process and
+    hung the whole suite. Each environ read also has a deadline, and the
+    whole sweep has a budget."""
+    t_end = time.time() + budget_s
     for d in os.listdir("/proc"):
-        if d.isdigit() and int(d) != os.getpid():
+        if not d.isdigit() or int(d) == os.getpid() or time.time() > t_end:
+            continue
+        try:
+            st = open(f"/proc/{d}/stat").read()
+            if st[st.rindex(")") + 2:].split()[0] in ("D", "X", "Z"):
+                continue
+        except (OSError, ValueError, IndexError):
+            continue
+        # Each pid gets its own result box, bound as a default argument. Without that the late
+        # thread of one pid writes into the *next* pid's box (the name is one local for the whole
+        # loop) and cleanup could SIGKILL an unrelated process (found in review).
+        box = {}
+
+        def read_env(d=d, box=box):
             try:
-                if f"DINGO_SCOPE_TAG={TAG}".encode() in open(f"/proc/{d}/environ", "rb").read().split(b"\0"):
-                    os.kill(int(d), signal.SIGKILL)
+                box["v"] = open(f"/proc/{d}/environ", "rb").read()
+            except OSError:
+                box["v"] = b""
+        th = threading.Thread(target=read_env, daemon=True)
+        th.start()
+        th.join(0.3)
+        if th.is_alive() or "v" not in box:
+            continue                       # too slow / still in flight: never act on a late result
+        if f"DINGO_SCOPE_TAG={TAG}".encode() in box["v"].split(b"\0"):
+            try:
+                os.kill(int(d), signal.SIGKILL)
             except OSError:
                 pass
 
 
 ALL = (test_grow_pause_resume, test_kill, test_session_cap, test_cgroup_detect, test_run_caps)
-only = os.environ.get("ONLY")
-for i, f in enumerate(ALL):
-    if only and f.__name__ not in only.split(","):
-        continue
-    TAG = f"oss006-{os.getpid()}-{i}"          # each test sees only its own processes
-    try:
-        f()
-    except Exception as e:
-        check(f.__name__ + " raised", False, repr(e))
-    finally:
-        cleanup()
-print(f"{sum(res)}/{len(res)} passed")
+
+
+def main():
+    global TAG
+    only = os.environ.get("ONLY")
+    for i, f in enumerate(ALL):
+        if only and f.__name__ not in only.split(","):
+            continue
+        TAG = f"oss006-{os.getpid()}-{i}"      # each test sees only its own processes
+        try:
+            f()
+        except Exception as e:
+            check(f.__name__ + " raised", False, repr(e))
+        finally:
+            cleanup()
+    print(f"{sum(res)}/{len(res)} passed")
+
+
+if __name__ == "__main__":
+    main()
