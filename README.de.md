@@ -33,7 +33,7 @@ Rudelführer für ein Dutzend Coding-Agenten auf einer Maschine. Seine fünf Ker
    Zwei Sicherheitsnetze: dingo führt das Roster jeder Session auf der Maschine, shepherd-dispatch
    führt die, die es selbst gestartet hat.
 
-Im Umzug (funktioniert hier weiter, jeweils mit Hinweis, wohin es zieht): `board`, `name`, `card`, `lint`,
+Wird ausgelagert (funktioniert hier weiter, jeweils mit Hinweis, wohin es zieht): `board`, `name`, `card`, `lint`,
 `queue` → shepherd-dispatch; `claim`, `boxes` → boobook-watch. Nicht mehr gepflegt (funktioniert
 aber noch): `close-all`, `stow` und das Öffnen von Terminal-Tabs (`resume` / `restore` / `unstow` mit
 `--via wt|tmux`); `--via print` bleibt.
