@@ -217,7 +217,10 @@ With `DINGO_ENFORCE=1` (or `"hook": {"enforce": true}`) the hint hook refuses in
 hinting: a heavy-looking Bash command (pytest, `python run_all.py`, train / eval / export /
 regress scripts, make, MinerU, ...; `bash -c`, `timeout`, `nohup`, `uv run`, `conda run` are
 looked through, also `bash -lc` and `env … bash -c`) that is not under `dingo-pack run` is
-denied, and the reason carries the command rewritten. Bulk copies, archives, `find` without
+denied. Each part of a compound line (`&&`, `;`, `|`, `$( )`, here-documents) is judged on its own,
+by the paths it reads and writes; only the offending part is refused, in three lines: that part,
+why, and how to change it (wrap it in `dingo-pack run --heavy` / `--io`, split it off, or work on
+the local disk). `DINGO_LANG=zh` (or a `zh` locale) gives the text in Chinese. Bulk copies, archives, `find` without
 `-maxdepth`, and `grep -r` / `rg` over a big tree on a network / 9p mount are denied too;
 `rg` / `grep -r` on a file or a small directory pass, a single-file `cp` only gets the hint, and
 a `cd ~/x && …` first is taken into account. How much memory an inline `python -c` takes is not

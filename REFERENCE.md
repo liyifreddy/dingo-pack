@@ -295,7 +295,12 @@ processes carrying the same tag (tests).
 ## Enforcing hook
 
 `hooks/hint.py` with `DINGO_ENFORCE=1` (or config `"hook": {"enforce": true}`) answers heavy
-Bash calls with `permissionDecision: deny` and a rewritten command. Config `"hook"`:
+Bash calls with `permissionDecision: deny`. A compound line is split into its parts (`;`, `&&`,
+`||`, `|`, `$( )`, `<( )`, backticks, here-documents fed to a shell, bash ANSI-C `$'...'`
+strings); each part is judged on its own and by the paths it reads / writes (`tar -C DIR`
+members inside DIR), not by the current directory as such. The reason is three lines - the
+refused part, why, how to fix it - in English, or Chinese with `DINGO_LANG=zh` (else `LC_ALL` /
+`LANG`). Config `"hook"`:
 `heavy_words` (list), `heavy_scripts` / `light_scripts` (regex on the script path),
 `enforce_io` (default true: bulk io on network / 9p mounts is denied; single-file cp / mv is
 only hinted), `small_scan` (default 500). `grep -r` / `rg` are judged by what they scan: a

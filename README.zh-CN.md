@@ -164,7 +164,7 @@ dingo-pack top                                            # 每个 session 用�
 
 ### 强制：不走 dingo 的重活直接拦下（Claude Code）
 
-提示 hook 加 `DINGO_ENFORCE=1`（或配置 `"hook": {"enforce": true}`）就从「提示」变成「拦」：像重活的 Bash 命令（pytest、`python run_all.py`、train / eval / export / regress 脚本、make、MinerU……；会拆开 `bash -c`、`bash -lc`、`env … bash -c`、`timeout`、`nohup`、`uv run`、`conda run`）没走 `dingo-pack run` 的被拒，拒绝理由里给出改好的命令；`/mnt/…` 上的批量拷贝、打包、不带 `-maxdepth` 的 `find`、扫大目录树的 `grep -r` / `rg` 也拒；`rg` / `grep -r` 查单个文件或小目录放行，单个文件的 `cp` 只提示，前面先 `cd ~/x && …` 的按 cd 之后的目录算。inline `python -c` 要吃多少内存判断不了，靠 `--mem`、规矩和 `watch`。子 agent、审查 skill 只提示（包不住）。hook 自己出错一律放行。规则可在配置 `"hook"` 里加：`heavy_words`、`heavy_scripts`（正则）、`light_scripts`（正则，永远不算重活）、`enforce_io`。
+提示 hook 加 `DINGO_ENFORCE=1`（或配置 `"hook": {"enforce": true}`）就从「提示」变成「拦」：像重活的 Bash 命令（pytest、`python run_all.py`、train / eval / export / regress 脚本、make、MinerU……；会拆开 `bash -c`、`bash -lc`、`env … bash -c`、`timeout`、`nohup`、`uv run`、`conda run`）没走 `dingo-pack run` 的被拒；复合命令（`&&`、`;`、`|`、`$( )`、heredoc）每段分别判，看的是这一段读写的路径，只拦出问题的那一段，拒绝提示三行：拦的是哪一段、为什么、怎么改（包 `dingo-pack run --heavy` / `--io`、拆开、或换到本地盘）；`DINGO_LANG=zh`（或 zh 的 locale）给中文提示；`/mnt/…` 上的批量拷贝、打包、不带 `-maxdepth` 的 `find`、扫大目录树的 `grep -r` / `rg` 也拒；`rg` / `grep -r` 查单个文件或小目录放行，单个文件的 `cp` 只提示，前面先 `cd ~/x && …` 的按 cd 之后的目录算。inline `python -c` 要吃多少内存判断不了，靠 `--mem`、规矩和 `watch`。子 agent、审查 skill 只提示（包不住）。hook 自己出错一律放行。规则可在配置 `"hook"` 里加：`heavy_words`、`heavy_scripts`（正则）、`light_scripts`（正则，永远不算重活）、`enforce_io`。
 
 ### 跑着的时候也盯：`watch`
 

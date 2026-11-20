@@ -90,6 +90,18 @@ cases13 = [  # (command, expected with enforcement, cwd)
  ("echo 'ls -la' | bash", "silent", LOCAL),                            # E27 a light echoed script stays allowed
  ("echo $((a<<b))\npython3 train.py\nb", "deny", LOCAL),               # E28 a shift is not a here-document (was allowed)
  ('echo "$(date) python3 train.py"', "silent", LOCAL),                 # E29 quoted text around a light $(...) is data
+ # 0.5.6 (开-079): each part judged on its own, by the paths it reads / writes, not by the cwd
+ ("git show HEAD:selftest_hook.py | sha256sum", "silent", NET),        # F1 read-only git show | sha256sum (U16)
+ (f"cp -r {LOCAL}/a {LOCAL}/b && ls {LOCAL}/b", "silent", NET),        # F2 local-disk cp while cwd is on 9p (开-037)
+ (f"python3 - <<'EOF'\np = 'selftest_x.py'\nEOF\necho done >> {NET}/log.md", "silent", NET),  # F3 heredoc + log append (开-038)
+ (f"cd {LOCAL} && cp -r a b && echo ok", "silent", NET),               # F4 copy inside a compound line (决赛 11-20)
+ (f"t $'cd x && echo \\'q\\''\nt 'cd {LOCAL} && cp -r a b'", "silent", NET),  # F5 $'..\'..' no longer flips the quoting
+ (f"tar -cf {LOCAL}/x.tar -C {LOCAL} a | sha256sum", "silent", NET),   # F6 tar members are taken inside -C DIR
+ (f"ls && cp -r {NET}/big {LOCAL}/x", "deny", LOCAL),                  # F7 a real cp -r of a big 9p tree: still refused
+ ("cp -r big copy", "deny", NET),                                      # F8 ... also as a relative path in a 9p cwd
+ (f"tar -cf {LOCAL}/x.tar -C {NET} big", "deny", LOCAL),               # F9 tar -C into the 9p disk: refused
+ ("cat <<'EOF' | bash\npython3 train.py\nEOF", "deny", LOCAL),          # F10 heredoc | bash running heavy work (0.5.3)
+ ("bash <<EOF\npytest -q\nEOF", "deny", LOCAL),                         # F11
 ]
 env13 = dict(os.environ, DINGO_ENFORCE="1", DINGO_HOME=os.path.join(BASE, "dh"), DINGO_FAKE_MOUNTS=mounts)
 for cmd, want, cwd in cases13:
@@ -100,6 +112,17 @@ for cmd, want, cwd in cases13:
     ok = got == want and r.returncode == 0
     bad += not ok
     print(("PASS" if ok else "FAIL"), "013", f"want={want:<6} got={got:<6}", f"[cwd {os.path.relpath(cwd, BASE)}]", cmd)
+# 0.5.6: the refusal names the part, says why and how, in English or (DINGO_LANG=zh) Chinese
+for lang, keys in (("en", ("refused this part: cp -r big copy", "\nWhy: ", "\nFix: ", "run --io -- cp -r big copy",
+                           "split them off")),
+                   ("zh", ("拦下了这一段：cp -r big copy", "\n为什么：", "\n怎么改：", "run --io -- cp -r big copy", "拆开"))):
+    r = subprocess.run([sys.executable, H], input=json.dumps({"tool_name": "Bash", "tool_input": {
+        "command": "ls && cp -r big copy"}}), capture_output=True, text=True, env=dict(env13, DINGO_LANG=lang), cwd=NET)
+    o = json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else {}
+    why = o.get("permissionDecisionReason") or ""
+    ok = o.get("permissionDecision") == "deny" and all(k in why for k in keys) and "ls &&" not in why.split("\n")[0]
+    bad += not ok
+    print(("PASS" if ok else "FAIL"), f"056 refusal text ({lang}) names the part, why and fix")
 gone = os.path.join(BASE, "gone")          # 013: the caller's cwd was deleted (os.getcwd() raises) -> still judged
 os.makedirs(gone, exist_ok=True)
 r = subprocess.run(["sh", "-c", f'cd "{gone}" && rmdir "{gone}" && exec "{sys.executable}" "{H}"'],

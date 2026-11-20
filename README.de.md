@@ -217,7 +217,10 @@ Mit `DINGO_ENFORCE=1` (oder `"hook": {"enforce": true}`) lehnt der Hint-Hook ab,
 nur zu hinweisen: Ein schwer wirkender Bash-Befehl (pytest, `python run_all.py`, Train-/Eval-/Export-/
 Regress-Skripte, make, MinerU, ...; `bash -c`, `timeout`, `nohup`, `uv run`, `conda run` werden durchschaut, ebenso
 `bash -lc` und `env … bash -c`), der nicht unter `dingo-pack run` läuft, wird
-verweigert, und die Begründung enthält den umgeschriebenen Befehl. Massenkopien, Archive, `find` ohne
+verweigert. Jeder Teil einer zusammengesetzten Zeile (`&&`, `;`, `|`, `$( )`, Here-Documents) wird einzeln
+nach den Pfaden beurteilt, die er liest und schreibt; abgelehnt wird nur der betroffene Teil, in drei Zeilen:
+welcher Teil, warum und wie man ihn ändert (in `dingo-pack run --heavy` / `--io` einpacken, abtrennen oder
+auf der lokalen Platte arbeiten). Mit `DINGO_LANG=zh` (oder einer `zh`-Locale) kommt der Text auf Chinesisch. Massenkopien, Archive, `find` ohne
 `-maxdepth` und `grep -r` / `rg` über einen großen Baum auf einem Netzwerk-/9p-Mount werden ebenfalls verweigert;
 `rg` / `grep -r` auf eine Datei oder ein kleines Verzeichnis gehen durch, ein einzelnes `cp` bekommt nur den Hinweis, und
 ein vorangestelltes `cd ~/x && …` wird berücksichtigt. Wie viel Speicher ein Inline-`python -c` braucht, wird nicht

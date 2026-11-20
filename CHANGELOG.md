@@ -1,5 +1,12 @@
 # 更新记录 / Changelog
 
+## 0.5.6 · 候选
+
+- **Hook refusals name the part:** a refused Bash call now says, in three lines, which part of the line was refused (as typed), why, and how to change it (wrap that part in `dingo-pack run --heavy` / `--io`, split it off, or work on the local disk); a relative path on a 9p cwd is pointed out. English by default, Chinese with `DINGO_LANG=zh` (or a `zh` `LC_ALL` / `LANG`).
+- **ANSI-C strings no longer flip the quoting:** `$'...\'...'` made shlex lose track of quotes, so quoted text (e.g. a `cp -r` inside an argument) was judged as a command in the cwd and refused as 9p bulk io.
+- **`tar -C DIR`:** members after `-C` / `--directory` are resolved inside DIR, not in the cwd (`tar -cf ~/x.tar -C ~/src dir` from a `/mnt/g` cwd is no longer refused).
+- Self-test: eleven new hook cases (read-only `git show | sha256sum`, local `cp` / heredoc / compound copy with a 9p cwd pass; `cp -r` of a big 9p tree, `tar -C` into 9p, heredoc `| bash` running heavy work still refused) and the refusal text in both languages.
+
 ## 0.5.5 · 2026-11-18
 
 - **Self-test passes on Python 3.8 again:** `t_stall_last_line` resolved the examples path from a relative `__file__` after an earlier test left the working directory deleted; it now uses the path taken at import.

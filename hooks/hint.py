@@ -167,7 +167,30 @@ def segment_io(w, mounts, cwd=None):
             return False                              # grep without -r / rg --max-depth 1: files named on the line
         limit = RULES.get("small_scan", SMALL_SCAN)
         return any(on_net(a) and scan_is_big(abspath(a, cwd), limit) for a in paths)
+    if cmd == "tar":
+        return any(on_net(a) for a in tar_paths(w, cwd))
     return any(on_net(a) for a in w[1:] if not a.startswith("-"))
+
+
+def tar_paths(w, cwd):
+    """Paths a tar command touches, the members after `-C DIR` / `--directory=DIR` taken inside DIR."""
+    out, base, i = [], cwd, 1
+    while i < len(w):
+        a = w[i]
+        d = None
+        if a in ("-C", "--directory") and i + 1 < len(w):
+            d, i = w[i + 1], i + 1
+        elif a.startswith("--directory="):
+            d = a.split("=", 1)[1]
+        elif a.startswith("-C") and len(a) > 2:
+            d = a[2:]
+        if d is not None:
+            base = abspath(d, base)
+            out.append(base)
+        elif not a.startswith("-"):
+            out.append(abspath(a, base))
+        i += 1
+    return out
 
 
 def segment_bulk(w):
@@ -376,13 +399,25 @@ def lift_quoted_substitutions(text):
     return "".join(out)
 
 
+ANSI_C = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
+
+
+def plain_ansi_c(text):
+    """`$'it\\'s'` (bash ANSI-C quoting) -> `'it'"'"'s'`: shlex does not know `\\'` inside it, and a
+    stray quote would turn the rest of the line inside out (quoted text judged as commands)."""
+    if "$'" not in text:
+        return text
+    import shlex
+    return ANSI_C.sub(lambda m: shlex.quote(re.sub(r"\\(['\\])", r"\1", m.group(1))), text)
+
+
 def segments(cmd, with_ops=False):
     """Split a shell command into simple commands (lists of words), honouring quotes. with_ops: pairs
     (words, operator that ends them). A substitution `$(...)` / `<(...)` / `>(...)` is a command of
     its own; the words after it still belong to the command it sits in."""
     import shlex
     try:
-        text = re.sub(r"`([^`]*)`", r"$(\1)", strip_heredocs(cmd))     # `...` is the old spelling of $(...)
+        text = re.sub(r"`([^`]*)`", r"$(\1)", strip_heredocs(plain_ansi_c(cmd)))     # `...` is the old spelling of $(...)
         text = lift_quoted_substitutions(text)
         lx = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=True)
         lx.whitespace_split = True
@@ -571,6 +606,56 @@ def flatten(cmd, cwd, depth=0):
     return segs, cwds
 
 
+def net_arg(w, mounts, cwd):
+    """The first argument of `w` that lies on a network / 9p mount (as typed), or None."""
+    args = tar_paths(w, cwd) if os.path.basename(w[0]) == "tar" else \
+        (search_targets(w)[1] if os.path.basename(w[0]) in SEARCHERS else [a for a in w[1:] if not a.startswith("-")])
+    for a in args:
+        if any((abspath(a, cwd).rstrip("/") + "/").startswith(m) for m in mounts):
+            return a
+    return None
+
+
+def chinese():
+    v = os.environ.get("DINGO_LANG") or os.environ.get("LC_ALL") or os.environ.get("LANG") or ""
+    return v.lower().startswith("zh")
+
+
+def refusal(kind, culprit, d, compound):
+    """Three plain lines: which part is refused, why, how to change it (English, or Chinese with DINGO_LANG=zh)."""
+    import shlex
+    w, cwd, path = culprit
+    part = " ".join(shlex.quote(x) for x in w)
+    rel = path is not None and not os.path.expanduser(path).startswith("/")
+    zh = chinese()
+    if kind == "heavy":
+        why = (f"`{os.path.basename(w[0])}` 像是测试 / 构建 / 训练这类重活；共享机器上的重活要排队等内存、限着内存跑，"
+               f"不然一个任务就能拖垮整台机器（连同 /mnt 盘）。" if zh else
+               f"`{os.path.basename(w[0])}` looks like a test run / build / training; heavy work on this shared machine"
+               f" must wait for memory and run under a cap, or one job can take the whole machine (and /mnt) down.")
+        fix = (f"把这一段包成 `{d} run --heavy --mem <峰值，如 4G> -- {part}`（小活 --mem 1G --threads 2）"
+               if zh else f"wrap this part: `{d} run --heavy --mem <peak, e.g. 4G> -- {part}` (small job: --mem 1G --threads 2)")
+    else:
+        where = path or "?"
+        if rel:
+            where = (f"{path}（相对当前目录 {cwd}）" if zh else f"{path} (relative to the current directory {cwd})")
+        why = (f"它在网络盘 / 9p 盘上大量读写（{where}），慢盘上一次大拷贝、大扫描能卡住整台机器。" if zh else
+               f"it copies / archives / scans a lot on a network or 9p disk ({where}); one big pass over that slow"
+               f" mount can stall the whole machine.")
+        fix = (f"把这一段包成 `{d} run --io -- {part}`，或先拷到本地盘（~/、/tmp）再在那里做" if zh else
+               f"wrap this part: `{d} run --io -- {part}`, or copy the data to the local disk (~/ or /tmp) and work there")
+        if rel:
+            fix += ("；路径本来就在本地盘的话，先 cd 过去或写绝对路径" if zh else
+                    "; if the data is really on a local disk, cd there first or give absolute paths")
+    if compound:
+        fix += ("。其余各段没问题，可以拆开照常跑" if zh else ". The other parts of the line are fine: split them off and run them as they are")
+    if zh:
+        return (f"dingo-pack 拦下了这一段：{part}\n为什么：{why}\n怎么改：{fix}。"
+                f"\n（判错了就写进日志；规则在 ~/.config/dingo-pack/config.json 的 \"hook\" 里。）")
+    return (f"dingo-pack refused this part: {part}\nWhy: {why}\nFix: {fix}."
+            f"\n(If this is wrong, say so in your log; the rules live in ~/.config/dingo-pack/config.json, \"hook\".)")
+
+
 def hint(data):
     """The message for the model, or None. Sets LAST_DENY when enforcement refuses the call."""
     global RULES, LAST_DENY
@@ -588,17 +673,21 @@ def hint(data):
         cmd = str(ti.get("command", ""))
         RULES = rules()
         segs, cwds = flatten(cmd, here())
-        io_segs = []
-        if any(segment_heavy(w) for w in segs):
-            kind, what = "heavy", "a heavy-looking shell command"
+        culprit = None                       # (words, cwd, net path) of the segment that is refused / hinted
+        heavy = [w for w in segs if segment_heavy(w)]
+        if heavy:
+            kind, what, culprit = "heavy", "a heavy-looking shell command", (strip_prefix(heavy[0]), None, None)
         else:
             mounts = net_mounts()
-            io_segs = [w for w, d in zip(segs, cwds) if w and not is_wrapped(w) and segment_io(w, mounts, d)]
+            io_segs = [(w, d) for w, d in zip(segs, cwds) if w and not is_wrapped(w) and segment_io(w, mounts, d)]
             if io_segs:
                 kind, what = "io", "a big read / write on a network or 9p disk"
+                bulk = [(w, d) for w, d in io_segs if segment_bulk(w)]
+                w, d = (bulk or io_segs)[0]
+                culprit = (w, d, net_arg(w, mounts, d))
+                if RULES["enforce"] and RULES["enforce_io"] and bulk:
+                    LAST_DENY = True
         if kind == "heavy" and RULES["enforce"]:
-            LAST_DENY = True
-        elif kind == "io" and RULES["enforce"] and RULES["enforce_io"] and any(segment_bulk(w) for w in io_segs):
             LAST_DENY = True
     if kind is None:
         return None
@@ -610,14 +699,7 @@ def hint(data):
            "io": f"{d} run --io -- <command>"}[kind]
     msg = f"dingo-pack: you are starting {what}. On this shared machine it takes a slot: {how}."
     if LAST_DENY:
-        whole = shlex.quote(str(ti.get("command", "")))
-        msg = (f"dingo-pack: refused - {what} outside dingo-pack. Heavy work on this machine must wait for memory"
-               f" and run under a cap, or one job can take the whole machine (and the /mnt drives) down. Re-run it as"
-               + (f" `{d} run --heavy --mem <peak, e.g. 4G> -- bash -c {whole}`" if kind == "heavy" else
-                  f" `{d} run --io -- bash -c {whole}`, or copy the data to the local disk (~/ or /tmp) first and work there")
-               + (". Small job: --mem 1G --threads 2. Reads a lot from /mnt/...: copy it to ~/ first, or use --io."
-                  if kind == "heavy" else ".")
-               + " If this is wrong, say so in your log; the rules live in ~/.config/dingo-pack/config.json (\"hook\").")
+        msg = refusal(kind, culprit, d, len(segs) > 1)
     try:
         info = status(exe)
         L = info["lanes"]
